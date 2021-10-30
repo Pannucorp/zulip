@@ -220,6 +220,7 @@ INSTALLED_APPS = [
     "django_otp.plugins.otp_static",
     "django_otp.plugins.otp_totp",
     "two_factor",
+    "pwa"
 ]
 if USING_PGROONGA:
     INSTALLED_APPS += ["pgroonga"]
@@ -1234,3 +1235,16 @@ SCIM_SERVICE_PROVIDER = {
         },
     ],
 }
+
+PWA_APP_NAME = 'My Kickass App'
+PWA_APP_DESCRIPTION = "Do kickass things all day long without that pesky browser chrome"
+PWA_APP_THEME_COLOR = '#0A0302'
+PWA_APP_BACKGROUND_COLOR = '#ffffff'
+PWA_APP_DISPLAY = 'standalone'
+PWA_APP_START_URL = '/'
+PWA_APP_ICONS = [
+    {
+        'src': '/static/images/my_app_icon.png',
+        'sizes': '160x160'
+    }
+]

@@ -200,12 +200,6 @@ cssutils==2.3.0 \
     --hash=sha256:0cf1f6086b020dee18048ff3999339499f725934017ef9ae2cd5bb77f9ab5f46 \
     --hash=sha256:b2d3b16047caae82e5c590036935bafa1b621cf45c2f38885af4be4838f0fd00
     # via premailer
-dataclasses==0.8 ; python_version < "3.7" \
-    --hash=sha256:0201d89fa866f68c8ebd9d08ee6ff50c0b255f8ec63a71c16fda7af82bb887bf \
-    --hash=sha256:8479067f342acf957dc82ec415d355ab5edb7e7646b90dc6e2fd1d96ad084c97
-    # via
-    #   -r requirements/common.in
-    #   werkzeug
 decorator==5.1.0 \
     --hash=sha256:7b12e7c3c6ab203a29e157335e9122cb03de9ab7264b137594103fd4a683b374 \
     --hash=sha256:e59913af105b9860aa2c8d3272d9de5a56a4e608db9a2f167a8480b323d529a7
@@ -274,6 +268,10 @@ django-phonenumber-field==5.2.0 \
     --hash=sha256:52b2e5970133ec5ab701218b802f7ab237229854dc95fd239b7e9e77dc43731d \
     --hash=sha256:5547fb2b2cc690a306ba77a5038419afc8fa8298a486fb7895008e9067cc7e75
     # via django-two-factor-auth
+django-progressive-web-app==0.1.1 \
+    --hash=sha256:5c0db3b0d78557094c73333bb73a5ce168d07af75a7588c85de4093bcde37a64 \
+    --hash=sha256:d158db2cd4c95bd8fd254eb79ab206392d4fdf8c2ba836e6446bbceecb033bc3
+    # via -r requirements/common.in
 django-scim2==0.17.0 \
     --hash=sha256:dc3cb3c0d5b6ebf4ae8a28dd1dac1e0658fb543c8c178e72e3c19975816da092
     # via -r requirements/common.in
@@ -380,17 +378,10 @@ idna==3.3 \
     --hash=sha256:84d9dd047ffa80596e0f246e2eab0b391788b0503584e8945f2368256d2735ff \
     --hash=sha256:9d643ff0a55b762d5cdb124b8eaa99c66322e2157b69160bc32796e824360e6d
     # via requests
-importlib-metadata==4.8.1 ; python_version < "3.8" \
+importlib-metadata==4.8.1 \
     --hash=sha256:b618b6d2d5ffa2f16add5697cf57a46c76a56229b0ed1c438322e4e95645bd15 \
     --hash=sha256:f284b3e11256ad1e5d03ab86bb2ccd6f5339688ff17a4d797a0fe7df326f23b1
-    # via
-    #   -r requirements/common.in
-    #   click
-    #   cssutils
-    #   jsonschema
-    #   markdown
-    #   sqlalchemy
-    #   zulip-bots
+    # via zulip-bots
 ipython==7.16.1 \
     --hash=sha256:2dbcc8c27ca7d3cfe4fcdff7f45b27f9a8d3edfa70ff8024a71c7a8eb5f09d64 \
     --hash=sha256:9f4fcb31d3b2c533333893b9172264e4821c1ac91839500f31bd43f2c59b3ccf
@@ -1196,9 +1187,6 @@ typing-extensions==3.10.0.2 \
     --hash=sha256:f1d25edafde516b146ecd0613dabcc61409817af4766fbbcfb8d1ad4ec441a34
     # via
     #   -r requirements/common.in
-    #   asgiref
-    #   importlib-metadata
-    #   mypy-boto3-s3
     #   zulip-bots
 uhashring==2.1 \
     --hash=sha256:b21340d0d32497a67f34f5177a64908115fdc23264ed87fa7d1eca79ef9641fa

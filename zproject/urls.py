@@ -2,7 +2,7 @@ import os
 from typing import List, Union
 
 from django.conf import settings
-from django.conf.urls import include
+from django.conf.urls import url, include
 from django.conf.urls.i18n import i18n_patterns
 from django.contrib.auth.views import (
     LoginView,
@@ -878,6 +878,7 @@ if settings.DEVELOPMENT:
 
 urls += [
     path("api/v1/", include(v1_api_mobile_patterns)),
+    url('', include('pwa.urls'))
 ]
 
 # The sequence is important; if i18n URLs don't come first then
