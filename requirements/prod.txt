@@ -237,6 +237,7 @@ django[argon2]==3.2.8 \
     #   django-formtools
     #   django-otp
     #   django-phonenumber-field
+    #   django-pwa
     #   django-scim2
     #   django-sendfile2
     #   django-two-factor-auth
@@ -268,9 +269,9 @@ django-phonenumber-field==5.2.0 \
     --hash=sha256:52b2e5970133ec5ab701218b802f7ab237229854dc95fd239b7e9e77dc43731d \
     --hash=sha256:5547fb2b2cc690a306ba77a5038419afc8fa8298a486fb7895008e9067cc7e75
     # via django-two-factor-auth
-django-progressive-web-app==0.1.1 \
-    --hash=sha256:5c0db3b0d78557094c73333bb73a5ce168d07af75a7588c85de4093bcde37a64 \
-    --hash=sha256:d158db2cd4c95bd8fd254eb79ab206392d4fdf8c2ba836e6446bbceecb033bc3
+django-pwa==1.0.10 \
+    --hash=sha256:07ed9dd57108838e3fe44b551a82032ca4ed76e31cb3c3e8d51604e0fe7e81e9 \
+    --hash=sha256:b1a2057b1e72c40c3a14beb90b958482da185f1d40a141fcae3d76580984b930
     # via -r requirements/common.in
 django-scim2==0.17.0 \
     --hash=sha256:dc3cb3c0d5b6ebf4ae8a28dd1dac1e0658fb543c8c178e72e3c19975816da092
