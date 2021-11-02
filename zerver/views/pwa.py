@@ -12,7 +12,7 @@ import zproject.settings
 
 def service_worker(request):
     # response = HttpResponse(open(zproject.settings.PWA_SERVICE_WORKER_PATH).read(), content_type='application/javascript')
-    response = render(request, 'pwa/serviceworker.js')
+    response = render(request, 'pwa/serviceworker.js',content_type='application/x-javascript')
     return response
 
 
