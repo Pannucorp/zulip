@@ -46,6 +46,22 @@
         {% set all_page_params = default_page_params.copy() %}
         {% set _ = all_page_params.update(page_params|default({})) %}
         <div hidden id="page-params" data-params='{{ all_page_params|tojson }}'></div>
+
+        <script type="text/javascript">
+            if ("serviceWorker" in navigator) {
+                window.addEventListener("load", () => {
+                navigator.serviceWorker
+                    .register("/sw.js")
+                    .then((registration) => {
+                      console.log(`Yay! ServiceWorker is loaded 🎉`)
+                    })
+                    .catch((err) => {
+                      console.log(`Boo! ServiceWorker didn't load 😬: ${err}`);
+                    });
+                });
+            }
+          </script>
+
     </body>
 
 </html>

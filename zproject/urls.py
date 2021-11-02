@@ -893,7 +893,7 @@ urls += [
     path("api/v1/", include(v1_api_mobile_patterns)),
     # url('', include('pwa.urls'))
 
-    url(r'^serviceworker\.js$', service_worker, name='serviceworker'),
+    url(r'^sw\.js$', service_worker, name='serviceworker'),
     url(r'^manifest\.json$', manifest, name='manifest'),
     url('^offline/$', offline, name='offline')
 
