@@ -1,0 +1,15 @@
+{
+  "name": {{ PWA_APP_NAME }},
+  "short_name": {{ PWA_APP_NAME }},
+  "description": {{ PWA_APP_DESCRIPTION }},
+  "start_url": {{ PWA_APP_START_URL }},
+  "display": {{ PWA_APP_DISPLAY }},
+  "scope": {{ PWA_APP_SCOPE }},
+  "orientation": {{ PWA_APP_ORIENTATION }},
+  "background_color": {{ PWA_APP_BACKGROUND_COLOR }},
+  "theme_color": {{ PWA_APP_THEME_COLOR }},
+  "status_bar": {{ PWA_APP_STATUS_BAR_COLOR }},
+  "icons": {{ PWA_APP_ICONS }},
+  "dir": {{ PWA_APP_DIR }},
+  "lang": {{ PWA_APP_LANG }}
+}

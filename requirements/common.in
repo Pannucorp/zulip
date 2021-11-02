@@ -197,3 +197,5 @@ soupsieve
 
 # pwa
 django-pwa
+pypandoc
+tox

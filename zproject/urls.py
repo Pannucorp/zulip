@@ -212,6 +212,19 @@ from zerver.views.video_calls import (
     make_zoom_video_call,
     register_zoom_user,
 )
+
+from zerver.views.pwa import (
+    service_worker,
+    manifest,
+    offline, 
+    my_page, 
+    say_something, 
+    random_response, 
+    fill_dynamic_cache, 
+    must_not_cache,
+    ServiceWorkerView
+)
+    
 from zerver.views.zephyr import webathena_kerberos_login
 from zproject import dev_urls
 from zproject.legacy_urls import legacy_urls
@@ -878,7 +891,24 @@ if settings.DEVELOPMENT:
 
 urls += [
     path("api/v1/", include(v1_api_mobile_patterns)),
-    url('', include('pwa.urls'))
+    # url('', include('pwa.urls'))
+
+    url(r'^serviceworker\.js$', service_worker, name='serviceworker'),
+    url(r'^manifest\.json$', manifest, name='manifest'),
+    url('^offline/$', offline, name='offline')
+
+    # path('', my_page, name='home'),
+    # path('offline/', offline, name='offline'),
+    # path('say-something/<str:key>', say_something, name='say_something'),
+    # path('random-response', random_response, name='random_response'),
+    # path('fill-dynamic-cache/<int:id>', fill_dynamic_cache, name='fill_dynamic_cache'),
+    # path('must-not-cache', must_not_cache, name='must_not_cache'),
+
+    # path(
+    #     'sw.js',
+    #     ServiceWorkerView.as_view(),
+    #     name=ServiceWorkerView.name,
+    # ),
 ]
 
 # The sequence is important; if i18n URLs don't come first then

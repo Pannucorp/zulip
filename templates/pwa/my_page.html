@@ -1,0 +1,16 @@
+{% extends "zerver/base.html" %}
+{% set entrypoint = entrypoint|default("portico") %}
+
+{% block title %}Test PWA site – Home page{% endblock %}
+
+{% block body %}
+    <h1>A page</h1>
+
+    <p>This is a very small and uninteresting page of a test site for Django and PWA</p>
+
+    <ul>
+    {% for route_name, route_url in routes.items %}
+        <li><a href="{{ route_url }}">{{ route_name }}</a></li>
+    {% endfor %}
+    </ul>
+{% endblock %}

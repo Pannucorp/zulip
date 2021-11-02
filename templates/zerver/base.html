@@ -1,12 +1,10 @@
 <!DOCTYPE html>
 <html lang='{{LANGUAGE_CODE}}'>
-
-    {# Base template for the whole site. #}
-    
-    {% load pwa %}
+    {# Base template for the whole site. #}    
     <head>
-        {% progressive_web_app_meta %}
         <meta charset="UTF-8" />
+        <link rel="manifest" href="/static/manifest.json">
+
         {% block title %}
             {% if user_profile and user_profile.realm.name %}
                 <title>{{user_profile.realm.name}} - Zulip</title>

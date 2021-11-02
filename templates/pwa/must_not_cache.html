@@ -1,0 +1,9 @@
+{% extends 'base.html' %}
+
+{% block title %}Must not cache{% endblock %}
+
+{% block body %}
+    <h1>Must not cache</h1>
+
+    <p>Requested: {{ requested_at | date:"Y-m-d H:s:s" }}</p>
+{% endblock %}
