@@ -16,12 +16,12 @@ def service_worker(request):
     return response
 
 
-def manifest(request):
-    return render(request, 'pwa/manifest.json', {
-        setting_name: getattr(zproject.settings, setting_name)
-        for setting_name in dir(zproject.settings)
-        if setting_name.startswith('PWA_')
-    }, content_type='application/json')
+# def manifest(request):
+#     return render(request, 'pwa/manifest.json', {
+#         setting_name: getattr(zproject.settings, setting_name)
+#         for setting_name in dir(zproject.settings)
+#         if setting_name.startswith('PWA_')
+#     }, content_type='application/json')
 
 def offline(request):
     return render(request, 'pwa/offline.html')

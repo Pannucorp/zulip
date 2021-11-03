@@ -215,7 +215,7 @@ from zerver.views.video_calls import (
 
 from zerver.views.pwa import (
     service_worker,
-    manifest,
+    # manifest,
     offline, 
     my_page, 
     say_something, 
@@ -894,7 +894,7 @@ urls += [
     # url('', include('pwa.urls'))
 
     url(r'^sw\.js$', service_worker, name='serviceworker'),
-    url(r'^manifest\.json$', manifest, name='manifest'),
+    # url(r'^manifest\.json$', manifest, name='manifest'),
     url('^offline/$', offline, name='offline')
 
     # path('', my_page, name='home'),
