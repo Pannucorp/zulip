@@ -1248,9 +1248,11 @@ resolve_url = lazy(resolve_url, str)
 _PWA_SCRIPT_PREFIX = get_script_prefix()
 
 # Path to the service worker implementation.  Default implementation is empty.
-PWA_SERVICE_WORKER_PATH = getattr(settings, 'PWA_SERVICE_WORKER_PATH',
-                                  os.path.join(os.path.abspath(os.path.dirname(__file__)), 'templates',
-                                               'serviceworker.js'))
+
+# PWA_SERVICE_WORKER_PATH = getattr(settings, 'PWA_SERVICE_WORKER_PATH',
+#                                   os.path.join(os.path.abspath(os.path.dirname(__file__)), 'templates',
+#                                                'serviceworker.js'))
+
 # App parameters to include in manifest.json and appropriate meta tags
 PWA_APP_NAME = getattr(settings, 'PWA_APP_NAME', 'PannuCorp')
 PWA_APP_DESCRIPTION = getattr(settings, 'PWA_APP_DESCRIPTION', 'PannuCorp Progressive Web App')
