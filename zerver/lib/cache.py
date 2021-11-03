@@ -95,7 +95,9 @@ def get_or_create_key_prefix() -> str:
         with open(filename, "x") as f:
             prefix = secrets.token_hex(16) + ":"
             f.write(prefix + "\n")
-    except FileExistsError:
+
+    except FileExistsError as e: 
+        print("file exists error::::::::::::", e)
         tries = 1
         while tries < 10:
             with open(filename) as f:
