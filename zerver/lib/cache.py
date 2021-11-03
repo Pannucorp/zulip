@@ -92,7 +92,7 @@ def get_or_create_key_prefix() -> str:
     filename = os.path.join(settings.DEPLOY_ROOT, "var", "remote_cache_prefix")
     print("filename is:::::::::::::::::::"+filename)
     try:
-        with open(filename, "x") as f:
+        with open(filename, "w") as f:
             prefix = secrets.token_hex(16) + ":"
             f.write(prefix + "\n")
 
