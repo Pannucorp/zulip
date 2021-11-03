@@ -90,14 +90,13 @@ def get_or_create_key_prefix() -> str:
     os.makedirs(os.path.join(settings.DEPLOY_ROOT, "var"), exist_ok=True)
 
     filename = os.path.join(settings.DEPLOY_ROOT, "var", "remote_cache_prefix")
-    print("filename is:::::::::::::::::::"+filename)
+    
     try:
         with open(filename, "w") as f:
             prefix = secrets.token_hex(16) + ":"
             f.write(prefix + "\n")
 
-    except FileExistsError as e: 
-        print("file exists error::::::::::::", e)
+    except FileExistsError: 
         tries = 1
         while tries < 10:
             with open(filename) as f:
