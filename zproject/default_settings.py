@@ -470,3 +470,5 @@ MAX_MESSAGE_LENGTH = 10000
 # More drafts, should they exist for some crazy reason, could be
 # fetched in a separate request.
 MAX_DRAFTS_IN_REGISTER_RESPONSE = 1000
+
+DEPLOY_ROOT = "/"
