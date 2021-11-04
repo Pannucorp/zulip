@@ -4,7 +4,11 @@
 
 name: Zulip CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [pwa]
+  pull_request:
+    branches: [pwa]
 
 defaults:
   run:
