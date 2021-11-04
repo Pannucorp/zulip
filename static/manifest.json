@@ -5,7 +5,7 @@
     "scope": ".",
     "display": "standalone",
     "background_color": "#FFF",
-    "theme_color": "#493174",
+    "theme_color": "#317EFB",
     "description": "PannuCorp",
     "dir": "ltr",
     "lang": "en-US",
@@ -13,10 +13,12 @@
     "icons": [{
         "src": "/static/icons/aurss.96x96.png",
         "type": "image/png",
-        "sizes": "96x96"
+        "sizes": "96x96",
+        "purpose": "any maskable"
     }, {
         "src": "/static/icons/aurss.512x512.png",
         "type": "image/png",
-        "sizes": "512x512"
+        "sizes": "512x512",
+        "purpose": "any maskable"
     }]
 }
