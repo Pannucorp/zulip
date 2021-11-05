@@ -48,8 +48,8 @@ PARENT_PATH=$(
     pwd -P
 )
 cd "$PARENT_PATH"
-mkdir -p /var/log
-LOG_PATH="/var/log/provision.log"
+mkdir -p ../var/log
+LOG_PATH="../var/log/provision.log"
 
 echo "PROVISIONING STARTING." >>$LOG_PATH
 
