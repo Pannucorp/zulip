@@ -1,7 +1,8 @@
 name: Zulip production suite
 
 on:
-  push: {}
+  push:
+    branches: [pwa]
   pull_request:
     paths:
       - .github/workflows/production-suite.yml
