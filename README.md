@@ -85,3 +85,10 @@ Zulip is distributed under the
 2. redis, setup password
 3. run command
    sudo ./scripts/setup/install --certbot --email=yuji.j@pannucorp.com --hostname=zulip-test.pannucorp.com
+
+# Docker Setup Step
+
+1. Build docker image in local
+   tools/ci/build-docker-images
+2. push->github action: production-suite, zulip-ci
+   workflows/production-suite
