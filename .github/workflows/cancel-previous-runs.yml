@@ -2,9 +2,9 @@ name: Cancel previous runs
 
 on:
   push:
-    branches: [pwa]
+    branches: []
   pull_request:
-    branches: [pwa]
+    branches: []
 
 defaults:
   run:
