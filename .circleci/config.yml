@@ -37,6 +37,9 @@ jobs:
           name: "Test docker"
           command: "docker run hello-world"
       - run:
+          name: "Install exact bundler"
+          command: "gem install bundler -v \"$(grep -A 1 \"BUNDLED WITH\" Gemfile.lock | tail -n 1)\""
+      - run:
           name: "Deploy zulip"
           command: "vagrant up --provider=docker"
 
