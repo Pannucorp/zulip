@@ -23,7 +23,7 @@ jobs:
           command: "sudo adduser $USER docker"
       - run:
           name: "Install bundler"
-          command: "gem update --system"
+          command: "gem update --system && bundle install"
       - run:
           name: "Install Zulip"
           command: "vagrant up --provider=docker"
