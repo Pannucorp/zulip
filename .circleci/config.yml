@@ -20,7 +20,7 @@ jobs:
           command: "sudo apt update && sudo apt install vagrant docker.io git"
       - run:
           name: "Add user to the group"
-          command: "sudo adduser $USER docker && exec $SHELL"
+          command: "sudo adduser $USER docker"
       - run:
           name: "Install Zulip"
           command: "vagrant up --provider=docker"
