@@ -16,14 +16,14 @@ jobs:
     steps:
       - checkout
       - run:
-        name: "Install prerequisites"
-        command: "sudo apt update && sudo apt install vagrant docker.io git"
+          name: "Install prerequisites"
+          command: "sudo apt update && sudo apt install vagrant docker.io git"
       -run:
-        name: "Add user to the group"
-        command: "sudo adduser $USER docker"
+          name: "Add user to the group"
+          command: "sudo adduser $USER docker"
       -run:
-        name: "Install Zulip"
-        command: "sudo vagrant up --provider=docker"
+          name: "Install Zulip"
+          command: "sudo vagrant up --provider=docker"
 
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
