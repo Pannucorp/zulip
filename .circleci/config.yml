@@ -22,11 +22,8 @@ jobs:
           name: "Add user to the group"
           command: "sudo adduser $USER docker"
       - run:
-          name: "Install bundler"
-          command: "gem update --system && bundle install"
-      - run:
           name: "Install Zulip"
-          command: "vagrant up --provider=docker"
+          command: "sudo vagrant up --provider=docker"
 
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
