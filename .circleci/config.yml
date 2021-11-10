@@ -23,7 +23,7 @@ jobs:
           command: "sudo adduser $USER docker"
       - run:
           name: "Install Zulip"
-          command: "sudo vagrant up --provider=docker"
+          command: "sudo vagrant up --provider=docker --docker_user=false"
 
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
