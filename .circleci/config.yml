@@ -18,10 +18,10 @@ jobs:
       - run:
           name: "Install prerequisites"
           command: "sudo apt update && sudo apt install vagrant docker.io git"
-      -run:
+      - run:
           name: "Add user to the group"
           command: "sudo adduser $USER docker"
-      -run:
+      - run:
           name: "Install Zulip"
           command: "sudo vagrant up --provider=docker"
 
