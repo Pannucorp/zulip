@@ -28,14 +28,14 @@ jobs:
           name: "Install docker engine"
           command: "sudo apt-get update && sudo apt-get install docker-ce docker-ce-cli containerd.io"
       - run:
-          name: "Install prerequisites"
-          command: "sudo apt install vagrant git"
-      - run:
           name: "Add user to the group"
           command: "sudo adduser $USER docker"
       - run:
-          name: "Test docker"
-          command: "docker run hello-world"
+          name: "Install exact bundler"
+          command: "gem install bundler -v \"$(grep -A 1 \"BUNDLED WITH\" Gemfile.lock | tail -n 1)\""
+      - run:
+          name: "Deploy zulip"
+          command: "vagrant up --provider=docker"
       - run:
           name: "Install exact bundler"
           command: "gem install bundler -v \"$(grep -A 1 \"BUNDLED WITH\" Gemfile.lock | tail -n 1)\""
