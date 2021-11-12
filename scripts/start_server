@@ -1,5 +1,4 @@
 cd /home/ubuntu/app
 vagrant destroy -f
 vagrant up --provider=docker
-vagrant ssh
-./tools/run-dev.py &
+vagrant ssh -c "cd /srv/zullip;./tools/run-dev.py"
