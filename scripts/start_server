@@ -1,4 +1,5 @@
 cd /home/ubuntu/app
 vagrant destroy -f
 vagrant up --provider=docker
-./tools/run-dev.py
+vagrant ssh
+./tools/run-dev.py &
