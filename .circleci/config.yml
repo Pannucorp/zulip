@@ -33,9 +33,6 @@ jobs:
     executor: aws-cli/default
     steps:
       - aws-cli/setup:
-          aws-access-key-id: AwsAccessKeyId
-          aws-secret-access-key: AwsSecretAccessKey
-          aws-region: AwsRegion
           version: latest
       - run:
           name: "AWS version"
