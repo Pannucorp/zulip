@@ -4,6 +4,8 @@ version: 2.1
 
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/2.0/configuration-reference/#jobs
+orbs:
+  aws-cli: circleci/aws-cli@2.0
 jobs:
   build-zulip:
     # Specify the execution environment. You can specify an image from Dockerhub or use one of our Convenience Images from CircleCI's Developer Hub.
@@ -15,18 +17,18 @@ jobs:
     # See: https://circleci.com/docs/2.0/configuration-reference/#steps
     steps:
       - checkout
-      - run:
-          name: "Install prerequisites"
-          command: "curl -O https://releases.hashicorp.com/vagrant/2.2.9/vagrant_2.2.9_x86_64.deb"
-      - run:
-          name: "Install vagrant"
-          command: "sudo apt install ./vagrant_2.2.9_x86_64.deb"
-      - run:
-          name: "Add user to the group"
-          command: "sudo adduser $USER docker"
-      - run:
-          name: "Deploy zulip"
-          command: "vagrant up --provider=docker"
+#      - run:
+#          name: "Install prerequisites"
+#          command: "curl -O https://releases.hashicorp.com/vagrant/2.2.9/vagrant_2.2.9_x86_64.deb"
+#      - run:
+#          name: "Install vagrant"
+#          command: "sudo apt install ./vagrant_2.2.9_x86_64.deb"
+#      - run:
+#          name: "Add user to the group"
+#          command: "sudo adduser $USER docker"
+#      - run:
+#          name: "Deploy zulip"
+#          command: "vagrant up --provider=docker"
 
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
