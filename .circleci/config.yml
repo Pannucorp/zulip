@@ -30,7 +30,9 @@ jobs:
 #      - run:
 #          name: "Deploy zulip"
 #          command: "vagrant up --provider=docker"
-      - aws-cli/setup:
+      - run:
+          name: "AWS version"
+          command: "aws --version"
 
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
