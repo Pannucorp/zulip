@@ -39,7 +39,7 @@ jobs:
           command: "aws --version"
       - run:
           name: "Git Repo"
-          command: "echo $CIRCLE_REPOSITORY_URL && echo $CIRCLE_SHA1"
+          command: "echo $CIRCLE_REPOSITORY_URL && echo $CIRCLE_PULL_REQUEST"
       - run:
           name: "Create AWS deploy"
           command: "aws deploy create-deployment \
