@@ -49,7 +49,7 @@ jobs:
             --application-name zulip-application \
             --deployment-group-name ZulipDeploymentGroup \
             --deployment-config-name CodeDeployDefault.OneAtATime \
-            --github-location repository=$CIRCLE_REPOSITORY_URL,commitId=$CIRCLE_SHA1"
+            --github-location repository=git@github.com:Pannucorp/zulip.git,commitId=5331e05192514ab498f0ea57a39ccaeacc074335"
 
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
