@@ -34,11 +34,11 @@ VAR_DIR_PATH = os.path.join(ZULIP_PATH, "var")
 
 CONTINUOUS_INTEGRATION = "GITHUB_ACTIONS" in os.environ
 
-if not os.path.exists(os.path.join(ZULIP_PATH, ".git")):
-    print(FAIL + "Error: No Zulip Git repository present!" + ENDC)
-    print("To set up the Zulip development environment, you should clone the code")
-    print("from GitHub, rather than using a Zulip production release tarball.")
-    sys.exit(1)
+# if not os.path.exists(os.path.join(ZULIP_PATH, ".git")):
+#     print(FAIL + "Error: No Zulip Git repository present!" + ENDC)
+#     print("To set up the Zulip development environment, you should clone the code")
+#     print("from GitHub, rather than using a Zulip production release tarball.")
+#     sys.exit(1)
 
 # Check the RAM on the user's system, and throw an effort if <1.5GB.
 # This avoids users getting segfaults running `pip install` that are
