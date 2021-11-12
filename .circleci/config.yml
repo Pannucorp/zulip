@@ -4,6 +4,8 @@ version: 2.1
 
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/2.0/configuration-reference/#jobs
+orbs:
+  aws-cli: circleci/aws-cli@2.0
 jobs:
   build-zulip:
     # Specify the execution environment. You can specify an image from Dockerhub or use one of our Convenience Images from CircleCI's Developer Hub.
@@ -15,22 +17,40 @@ jobs:
     # See: https://circleci.com/docs/2.0/configuration-reference/#steps
     steps:
       - checkout
+#      - run:
+#          name: "Install prerequisites"
+#          command: "curl -O https://releases.hashicorp.com/vagrant/2.2.9/vagrant_2.2.9_x86_64.deb"
+#      - run:
+#          name: "Install vagrant"
+#          command: "sudo apt install ./vagrant_2.2.9_x86_64.deb"
+#      - run:
+#          name: "Add user to the group"
+#          command: "sudo adduser $USER docker"
+#      - run:
+#          name: "Deploy zulip"
+#          command: "vagrant up --provider=docker"
+  aws-deploy:
+    executor: aws-cli/default
+    steps:
+      - aws-cli/setup:
+          version: latest
       - run:
-          name: "Install prerequisites"
-          command: "curl -O https://releases.hashicorp.com/vagrant/2.2.9/vagrant_2.2.9_x86_64.deb"
+          name: "AWS version"
+          command: "aws --version"
       - run:
-          name: "Install vagrant"
-          command: "sudo apt install ./vagrant_2.2.9_x86_64.deb"
+          name: "Git Repo"
+          command: "echo $CIRCLE_REPOSITORY_URL && echo $CIRCLE_SHA1"
       - run:
-          name: "Add user to the group"
-          command: "sudo adduser $USER docker"
-      - run:
-          name: "Deploy zulip"
-          command: "vagrant up --provider=docker"
-
+          name: "Create AWS deploy"
+          command: "aws deploy create-deployment \
+            --application-name zulip-application \
+            --deployment-group-name ZulipDeploymentGroup \
+            --deployment-config-name CodeDeployDefault.OneAtATime \
+            --github-location repository=git@github.com:Pannucorp/zulip.git,commitId=5331e05192514ab498f0ea57a39ccaeacc074335"
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
 workflows:
   zulip-workflow:
     jobs:
-      - build-zulip
+#      - build-zulip
+      - aws-deploy
