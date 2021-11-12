@@ -41,12 +41,15 @@ jobs:
           name: "AWS version"
           command: "aws --version"
       - run:
+          name: "Git Repo"
+          command: "echo $CIRCLE_REPOSITORY_URL && echo $CIRCLE_SHA1"
+      - run:
           name: "Create AWS deploy"
           command: "aws deploy create-deployment \
             --application-name zulip-application \
             --deployment-group-name ZulipDeploymentGroup \
             --deployment-config-name CodeDeployDefault.OneAtATime \
-            --github-location repository=${CIRCLE_REPOSITORY_URL},commitId=${CIRCLE_SHA1}"
+            --github-location repository=$CIRCLE_REPOSITORY_URL,commitId=$CIRCLE_SHA1"
 
 # Invoke jobs via workflows
 # See: https://circleci.com/docs/2.0/configuration-reference/#workflows
