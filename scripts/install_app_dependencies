@@ -1,0 +1,2 @@
+cd /home/ubuntu
+chmod -R 777 app/
