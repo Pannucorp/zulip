@@ -32,6 +32,7 @@ jobs:
   aws-deploy:
     executor: aws-cli/default
     steps:
+      - aws-cli/setup:
       - run:
           name: "AWS version"
           command: "aws --version"
