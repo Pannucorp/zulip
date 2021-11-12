@@ -33,7 +33,7 @@ jobs:
     executor: aws-cli/default
     steps:
       - aws-cli/setup:
-          profile-name: example
+          version: latest
       - run:
           name: "AWS version"
           command: "aws --version"
