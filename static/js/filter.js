@@ -625,7 +625,7 @@ export class Filter {
         if (term_types.length === 1 || (term_types.length === 2 && term_types[1] === "search")) {
             switch (term_types[0]) {
                 case "in-home":
-                    return $t({defaultMessage: "Enter messages"});
+                    return $t({defaultMessage: "All messages"});
                 case "in-all":
                     return $t({defaultMessage: "All messages including muted streams"});
                 case "streams-public":
