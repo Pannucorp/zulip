@@ -1,0 +1,275 @@
+version: 2
+aliases:
+  - &create_cache_directories
+    run:
+      name: Create cache directories
+      command: |
+        dirs=(/srv/zulip-{npm,venv,emoji}-cache)
+        sudo mkdir -p "${dirs[@]}"
+        sudo chown -R github "${dirs[@]}"
+
+  - &restore_node_modules_cache
+    restore_cache:
+      name: Restore node_modules cache
+      keys:
+        - v1-npm-base.{{ .Environment.CIRCLE_JOB }}-{{ checksum "package.json" }}-{{ checksum "yarn.lock" }}
+
+  - &restore_python_cache
+    restore_cache:
+      name: Restore python cache
+      keys:
+        - v1-venv-base.{{ .Environment.CIRCLE_JOB }}-{{ checksum "requirements/dev.txt" }}
+
+  - &restore_emoji_cache
+    restore_cache:
+      name: Restore emoji cache
+      keys:
+        - v1-venv-base.{{ .Environment.CIRCLE_JOB }}-{{ checksum "tools/setup/emoji/emoji_map.json" }}-{{ checksum "tools/setup/emoji/build_emoji" }}-{{checksum "tools/setup/emoji/emoji_setup_utils.py" }}-{{ checksum "tools/setup/emoji/emoji_names.py" }}-{{ checksum "package.json" }}
+
+  - &do_bionic_hack
+    run:
+      name: Do Bionic hack
+      command: |
+        # Temporary hack till `sudo service redis-server start` gets fixes in Bionic. See
+        # https://chat.zulip.org/#narrow/stream/3-backend/topic/Ubuntu.20bionic.20CircleCI
+        sudo sed -i '/^bind/s/bind.*/bind 0.0.0.0/' /etc/redis/redis.conf
+
+  - &install_dependencies
+    run:
+      name: Install dependencies
+      command: |
+        # This is the main setup job for the test suite
+        ./tools/ci/setup-backend --skip-dev-db-build
+
+        # Cleaning caches is mostly unnecessary in CircleCI Actions, because
+        # most builds don't get to write to the cache.
+        # scripts/lib/clean_unused_caches.py --verbose --threshold 0
+
+  - &save_node_modules_cache
+    save_cache:
+      name: Save node_modules cache
+      paths:
+        - /srv/zulip-npm-cache
+      key: v1-npm-base.{{ .Environment.CIRCLE_JOB }}-{{ checksum "package.json" }}-{{ checksum "yarn.lock" }}
+
+  - &save_python_cache
+    save_cache:
+      name: Save python cache
+      paths:
+        - /srv/zulip-venv-cache
+      key: v1-venv-base.{{ .Environment.CIRCLE_JOB }}-{{ checksum "requirements/dev.txt" }}
+
+  - &save_emoji_cache
+    save_cache:
+      name: Save emoji cache
+      paths:
+        - /srv/zulip-emoji-cache
+      key: v1-venv-base.{{ .Environment.CIRCLE_JOB }}-{{ checksum "tools/setup/emoji/emoji_map.json" }}-{{ checksum "tools/setup/emoji/build_emoji" }}-{{checksum "tools/setup/emoji/emoji_setup_utils.py" }}-{{ checksum "tools/setup/emoji/emoji_names.py" }}-{{ checksum "package.json" }}
+
+  - &run_tools_test
+    run:
+      name: Run tools test
+      command: |
+        source tools/ci/activate-venv
+        ./tools/test-tools
+
+  - &run_code_spell_lint
+    run:
+      name: Run Codespell lint
+      command: |
+        source tools/ci/activate-venv
+        ./tools/run-codespell
+
+  - &run_backend_lint
+    run:
+      name: Run backend lint
+      command: |
+        source tools/ci/activate-venv
+        echo "Test suite is running under $(python --version)."
+        ./tools/lint --groups=backend --skip=gitlint,mypy # gitlint disabled because flaky
+
+  - &run_frontend_lint
+    run:
+      name: Run frontend lint
+      command: |
+        source tools/ci/activate-venv
+        ./tools/lint --groups=frontend --skip=gitlint # gitlint disabled because flaky
+
+  - &run_backend_tests
+    run:
+      name: Run backend tests
+      command: |
+        source tools/ci/activate-venv
+        ./tools/test-backend zerver.tests.test_home
+
+  - &run_mypy
+    run:
+      name: Run mypy
+      command: |
+        source tools/ci/activate-venv
+        # We run mypy after the backend tests so we get output from the
+        # backend tests, which tend to uncover more serious problems, first.
+        ./tools/run-mypy --version
+        ./tools/run-mypy
+
+  - &run_miscellaneous_tests
+    run:
+      name: Run miscellaneous tests
+      command: |
+        source tools/ci/activate-venv
+
+        # Currently our compiled requirements files will differ for different python versions
+        # so we will run test-locked-requirements only for Bionic.
+        # ./tools/test-locked-requirements
+        # ./tools/test-run-dev  # https://github.com/zulip/zulip/pull/14233
+        #
+        # This test has been persistently flaky at like 1% frequency, is slow,
+        # and is for a very specific single feature, so we don't run it by default:
+        # ./tools/test-queue-worker-reload
+
+        ./tools/test-migrations
+        ./tools/setup/optimize-svg --check
+        ./tools/setup/generate_integration_bots_avatars.py --check-missing
+
+  - &run_documentation_and_api_tests
+    run:
+      name: Run documentation and api tests
+      command: |
+        source tools/ci/activate-venv
+        # In CI, we only test links we control in test-documentation to avoid flakes
+        ./tools/test-documentation --skip-external-links
+        ./tools/test-help-documentation --skip-external-links
+        ./tools/test-api
+
+  - &run_node_tests
+    run:
+      name: Run node tests
+      command: |
+        source tools/ci/activate-venv
+        # Run the node tests first, since they're fast and deterministic
+        ./tools/test-js-with-node --coverage --parallel=1
+
+  - &check_schemas
+    run:
+      name: Check schemas
+      command: |
+        source tools/ci/activate-venv
+        # Check that various schemas are consistent. (is fast)
+        ./tools/check-schemas
+
+  - &check_capitalization_of_strings
+    run:
+      name: Check capitalization of strings
+      command: |
+        source tools/ci/activate-venv
+        ./manage.py makemessages --locale en
+        PYTHONWARNINGS=ignore ./tools/check-capitalization --no-generate
+        PYTHONWARNINGS=ignore ./tools/check-frontend-i18n --no-generate
+
+  - &run_puppeteer_tests
+    run:
+      name: Run puppeteer tests
+      command: |
+        source tools/ci/activate-venv
+        ./tools/test-js-with-puppeteer
+
+  - &check_for_untracked_files
+    run:
+      name: Check for untracked files
+      command: |
+        source tools/ci/activate-venv
+        # This final check looks for untracked files that may have been
+        # created by test-backend or provision.
+        untracked="$(git ls-files --exclude-standard --others)"
+        if [ -n "$untracked" ]; then
+            printf >&2 "Error: untracked files:\n%s\n" "$untracked"
+            exit 1
+        fi
+
+  - &test_locked_requirements
+    run:
+      name: Test locked requirements
+      command: |
+        . /srv/zulip-py3-venv/bin/activate && \
+        ./tools/test-locked-requirements
+
+  - &store_puppeteer_artifacts
+    store_artifacts:
+      name: Store Puppeteer artifacts
+      path: ./var/puppeteer/
+      destination: puppeteer
+
+
+
+  - &install_production
+    run:
+      name: install production
+      command: |
+        sudo service rabbitmq-server restart
+        sudo --preserve-env=CIRCLECI mispipe "/tmp/production-install 2>&1" ts
+
+  - &verify_production
+    run:
+      name: verify install
+      command: |
+        sudo --preserve-env=CIRCLECI mispipe "/tmp/production-verify 2>&1" ts
+
+jobs:
+  Test:
+    docker:
+      - image: zulip/ci:bionic
+
+    working_directory: ~/zulip
+
+    environment:
+      GITHUB_ACTIONS: 1
+
+    steps:
+      - checkout
+
+      - *create_cache_directories
+      - *restore_node_modules_cache
+      - *restore_python_cache
+      - *restore_emoji_cache
+      - *do_bionic_hack
+      - *install_dependencies
+      - *save_node_modules_cache
+      - *save_python_cache
+      - *save_emoji_cache
+      - *run_tools_test
+      #      - *run_code_spell_lint
+      #      - *run_backend_lint
+      #      - *run_frontend_lint
+      - *run_backend_tests
+      - *run_mypy
+      - *run_miscellaneous_tests
+      - *run_documentation_and_api_tests
+      #      - *run_node_tests
+      - *check_schemas
+      #      - *check_capitalization_of_strings
+      #      - *run_puppeteer_tests
+      - *check_for_untracked_files
+      - *test_locked_requirements
+      - *store_puppeteer_artifacts
+
+  Deploy:
+    machine:
+        enabled: true
+    steps:
+      - run:
+          name: Deploy develop to AWS
+          command: |
+            ssh $SSH_USER@$SSH_HOST "/home/zulip/deployments/current/scripts/upgrade-zulip-from-git pwa"
+
+workflows:
+  version: 2
+  Test_and_Deploy:
+    jobs:
+      - Test
+      - Deploy:
+          requires:
+            - Test
+          filters:
+              branches:
+                only:
+                  - pwa
