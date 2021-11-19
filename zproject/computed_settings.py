@@ -13,6 +13,11 @@ import zerver.lib.logging_util
 from scripts.lib.zulip_tools import get_tornado_ports
 from zerver.lib.db import TimeTrackingConnection
 
+from django.conf import settings
+from django.shortcuts import resolve_url
+from django.urls import get_script_prefix
+from django.utils.functional import lazy
+
 from .config import (
     DEPLOY_ROOT,
     DEVELOPMENT,
@@ -220,6 +225,7 @@ INSTALLED_APPS = [
     "django_otp.plugins.otp_static",
     "django_otp.plugins.otp_totp",
     "two_factor",
+    "pwa"
 ]
 if USING_PGROONGA:
     INSTALLED_APPS += ["pgroonga"]
@@ -1234,3 +1240,6 @@ SCIM_SERVICE_PROVIDER = {
         },
     ],
 }
+
+# Lazy-evaluate URLs so including pwa.urls in root urlconf works
+resolve_url = lazy(resolve_url, str)
