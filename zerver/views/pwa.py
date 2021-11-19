@@ -16,7 +16,7 @@ def service_worker(request):# type: ignore[no-untyped-def]
     return response
 
 
-# def manifest(request):
+# def manifest(request):# type: ignore[no-untyped-def] 
 #     return render(request, 'pwa/manifest.json', {
 #         setting_name: getattr(zproject.settings, setting_name)
 #         for setting_name in dir(zproject.settings)

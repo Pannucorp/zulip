@@ -1,10 +1,12 @@
 <!DOCTYPE html>
 <html lang='{{LANGUAGE_CODE}}'>
-
-    {# Base template for the whole site. #}
-
+    {# Base template for the whole site. #}    
     <head>
         <meta charset="UTF-8" />
+        <meta name="theme-color" content="#317EFB"/>
+        <link href="/static/images/logo/apple-touch-icon-precomposed.png" rel="apple-touch-icon" />
+        <link rel="manifest" href="/static/manifest.json">
+
         {% block title %}
             {% if user_profile and user_profile.realm.name %}
                 <title>{{user_profile.realm.name}} - Zulip</title>
@@ -46,6 +48,22 @@
         {% set all_page_params = default_page_params.copy() %}
         {% set _ = all_page_params.update(page_params|default({})) %}
         <div hidden id="page-params" data-params='{{ all_page_params|tojson }}'></div>
+
+        <script type="text/javascript">
+            if ("serviceWorker" in navigator) {
+                window.addEventListener("load", () => {
+                navigator.serviceWorker
+                    .register("/sw.js")
+                    .then((registration) => {
+                      console.log(`Yay! ServiceWorker is loaded 🎉`)
+                    })
+                    .catch((err) => {
+                      console.log(`Boo! ServiceWorker didn't load 😬: ${err}`);
+                    });
+                });
+            }
+          </script>
+
     </body>
 
 </html>
