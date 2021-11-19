@@ -71,6 +71,7 @@ aliases:
       name: Run tools test
       command: |
         source tools/ci/activate-venv
+        ./tools/update-locked-requirements.sh
         ./tools/test-tools
 
   - &run_code_spell_lint
