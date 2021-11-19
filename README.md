@@ -79,4 +79,16 @@ Zulip is distributed under the
 
 [beginner-friendly]: https://github.com/zulip/zulip/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22
 
-# Test
+# Production Setup Step
+
+1. domain
+2. redis, setup password
+3. run command
+   sudo ./scripts/setup/install --certbot --email=yuji.j@pannucorp.com --hostname=zulip-test.pannucorp.com
+
+# Docker Setup Step
+
+1. Build docker image in local
+   tools/ci/build-docker-images
+2. push->github action: production-suite, zulip-ci
+   workflows/production-suite

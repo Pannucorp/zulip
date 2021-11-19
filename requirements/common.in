@@ -194,3 +194,8 @@ django-scim2
 
 # CSS manipulation
 soupsieve
+
+# pwa
+django-pwa
+pypandoc
+tox
