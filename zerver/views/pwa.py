@@ -10,7 +10,7 @@ from django.views.decorators.cache import never_cache
 from django.views.generic import TemplateView
 import zproject.settings
 
-def service_worker(request):
+def service_worker(request) -> HttpResponse:
     # response = HttpResponse(open(zproject.settings.PWA_SERVICE_WORKER_PATH).read(), content_type='application/javascript')
     response = render(request, 'pwa/serviceworker.js',content_type='application/x-javascript')
     return response
@@ -23,11 +23,11 @@ def service_worker(request):
 #         if setting_name.startswith('PWA_')
 #     }, content_type='application/json')
 
-def offline(request):
+def offline(request) -> HttpResponse:
     return render(request, 'pwa/offline.html')
 
 
-def my_page(request):
+def my_page(request) -> HttpResponse:
     routes = {
         'Home': reverse('home'),
         'Say hi': reverse('say_something', kwargs={'key': 'hi'}),
@@ -41,7 +41,7 @@ def my_page(request):
     return render(request, 'pwa/my_page.html', context={'routes': routes})
 
 
-def say_something(request, key):
+def say_something(request, key) -> HttpResponse:
     things_to_say = {
         'hi': 'Hello world',
         'bye': 'Have a nice day',
@@ -53,7 +53,7 @@ def say_something(request, key):
     return render(request, 'pwa/say_something.html', context={'thing': things_to_say[key]})
 
 
-def random_response(request):
+def random_response(request) -> HttpResponse:
     response_time_ms = random.choice((0, 10, 50, 100, 1_000, 10_000))
     response_time = response_time_ms / 1_000
     print(f'Selected response time {response_time}')
@@ -61,12 +61,12 @@ def random_response(request):
     return render(request, 'pwa/random_response.html', context={'response_time': response_time})
 
 
-def fill_dynamic_cache(request, id):
+def fill_dynamic_cache(request, id) -> HttpResponse:
     return render(request, 'pwa/fill_dynamic_cache.html', context={'id': id})
 
 
 @never_cache
-def must_not_cache(request):
+def must_not_cache(request) -> HttpResponse:
     return render(request, 'pwa/must_not_cache.html', context={'requested_at': timezone.now()})
 
 
@@ -75,7 +75,7 @@ class ServiceWorkerView(TemplateView):
     content_type = 'application/javascript'
     name = 'sw.js'
 
-    def get_context_data(self, **kwargs):
+    def get_context_data(self, **kwargs) -> HttpResponse:
         print(f'Selected response time::::::::::::::::::')
         return {
             'version': '1.0.1',
