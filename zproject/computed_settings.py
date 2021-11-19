@@ -224,8 +224,7 @@ INSTALLED_APPS = [
     "django_otp",
     "django_otp.plugins.otp_static",
     "django_otp.plugins.otp_totp",
-    "two_factor",
-    "pwa"
+    "two_factor"
 ]
 if USING_PGROONGA:
     INSTALLED_APPS += ["pgroonga"]
@@ -1240,6 +1239,3 @@ SCIM_SERVICE_PROVIDER = {
         },
     ],
 }
-
-# Lazy-evaluate URLs so including pwa.urls in root urlconf works
-resolve_url = lazy(resolve_url, str)
