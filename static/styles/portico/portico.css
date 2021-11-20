@@ -495,7 +495,7 @@ input.text-error {
 
 .portico-container {
     position: relative;
-
+    overflow-x: hidden;
     .if-zulip-electron {
         display: none;
     }
