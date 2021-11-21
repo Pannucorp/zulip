@@ -256,6 +256,10 @@ jobs:
       enabled: true
     steps:
       - run:
+          name: Stop previous deployment 
+          command: |
+            ssh $SSH_USER@$SSH_HOST "rmdir /home/zulip/deployments/lock"
+      - run:
           name: Deploy pwa2 to AWS
           command: |
             ssh $SSH_USER@$SSH_HOST "/home/zulip/deployments/current/scripts/upgrade-zulip-from-git pwa2"
@@ -264,10 +268,10 @@ workflows:
   version: 2
   Test_and_Deploy:
     jobs:
-      - Test
+      # - Test
       - Deploy:
           requires:
-            - Test
+            # - Test
           filters:
             branches:
               only:
