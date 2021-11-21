@@ -255,10 +255,10 @@ jobs:
     machine:
       enabled: true
     steps:
-      - run:
-          name: Stop previous deployment 
-          command: |
-            ssh $SSH_USER@$SSH_HOST "rmdir /home/zulip/deployments/lock"
+      # - run:
+      #     name: Stop previous deployment 
+      #     command: |
+      #       ssh $SSH_USER@$SSH_HOST "rmdir /home/zulip/deployments/lock"
       - run:
           name: Deploy pwa2 to AWS
           command: |
