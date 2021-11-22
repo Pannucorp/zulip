@@ -1,4 +1,4 @@
-name: Django CI
+name: Production Install
 
 on:
   push:
@@ -24,4 +24,4 @@ jobs:
     - name: Run production install
       run: |
         sudo -s
-        ./scripts/setup/install --certbot --email=yuji.j@pannucorp.com --hostname=zulip-test.pannucorp.com
+        sudo ./scripts/setup/install --certbot --email=yuji.j@pannucorp.com --hostname=zulip-test.pannucorp.com
