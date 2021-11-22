@@ -264,7 +264,11 @@ workflows:
   version: 2
   Test_and_Deploy:
     jobs:
-      - Test
+      - Test:
+          filters:
+            branches:
+              only:
+                - develop
       - Deploy:
           requires:
             - Test
