@@ -9,7 +9,7 @@ on:
 jobs:
   CodeQL:
     if: ${{!github.event.repository.private}}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
