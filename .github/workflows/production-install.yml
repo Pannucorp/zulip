@@ -24,4 +24,5 @@ jobs:
     - name: Run production install
       run: |
         # sudo ./scripts/setup/install --certbot --email=yuji.j@pannucorp.com --hostname=zulip-test.pannucorp.com
-        sudo ./scripts/upgrade-zulip-from-git pwa2
+        # sudo ./scripts/upgrade-zulip-from-git pwa2
+        /home/zulip/deployments/current/scripts/upgrade-zulip-from-git pwa2
