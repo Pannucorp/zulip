@@ -21,6 +21,6 @@ jobs:
       uses: actions/setup-python@v2
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Run production install
-      run: |
-        sudo ./scripts/upgrade-zulip-from-git pwa2
+    # - name: Run production install
+    #   run: |
+    #     sudo ./scripts/upgrade-zulip-from-git pwa2

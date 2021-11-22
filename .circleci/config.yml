@@ -256,9 +256,9 @@ jobs:
       enabled: true
     steps:
       - run:
-          name: Deploy develop to AWS
+          name: Deploy pwa2 to AWS
           command: |
-            ssh $SSH_USER@$SSH_HOST "/home/zulip/deployments/current/scripts/upgrade-zulip-from-git develop"
+            ssh $SSH_USER@$SSH_HOST "/home/zulip/deployments/current/scripts/upgrade-zulip-from-git pwa2"
 
 workflows:
   version: 2
@@ -268,11 +268,11 @@ workflows:
           filters:
             branches:
               only:
-                - develop
+                - pwa2
       - Deploy:
           requires:
             - Test
           filters:
             branches:
               only:
-                - develop
+                - pwa2
