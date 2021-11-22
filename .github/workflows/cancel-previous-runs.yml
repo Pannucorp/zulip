@@ -11,9 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
 
-    # Don't run this job for zulip/zulip pushes since we
-    # want to run those jobs.
-    if: ${{ github.event_name != 'push' || github.event.repository.full_name != 'zulip/zulip' }}
+    # Don't run this job for zulip/zulip pushes since we want to run those jobs.
+    if: ${{ github.event_name != 'push' || github.event.repository.full_name != 'pannucorp/zulip' }}
 
     steps:
       # We get workflow IDs from GitHub API so we don't have to maintain
