@@ -8,7 +8,7 @@ defaults:
 jobs:
   cancel:
     name: Cancel previous runs
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 3
 
     # Don't run this job for zulip/zulip pushes since we want to run those jobs.
