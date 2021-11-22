@@ -4,7 +4,7 @@ on:
     types: [published]
 jobs:
   update-digitalocean-oneclick-app:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v2
       - name: Update DigitalOcean one click app

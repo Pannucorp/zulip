@@ -31,7 +31,7 @@ jobs:
     # This job builds a release tarball from the current commit, which
     # will be used for all of the following install/upgrade tests.
     name: Bionic production build
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     # This docker image was created by a generated Dockerfile at:
     #   tools/ci/images/bionic/Dockerfile
@@ -143,7 +143,7 @@ jobs:
     container:
       image: ${{ matrix.docker_image }}
       options: --init
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: production_build
 
     steps:
@@ -231,7 +231,7 @@ jobs:
     container:
       image: ${{ matrix.docker_image }}
       options: --init
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: production_build
 
     steps:

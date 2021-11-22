@@ -37,7 +37,7 @@ jobs:
             is_bullseye: true
             include_frontend_tests: false
 
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     name: ${{ matrix.name }}
     container: ${{ matrix.docker_image }}
     env:
