@@ -93,11 +93,10 @@ Zulip is distributed under the
 2. push->github action: production-suite, zulip-ci
    workflows/production-suite
 
-# Uninstall guide
+# Reinstall guide
 
 sudo service nginx stop
 sudo rm -rf /etc/zulip /var/log/zulip /home/zulip/* /srv/zulip-*
-
-# Install guide
-
+sudo rm -rf /home/ubuntu/workspace/zulip
+sudo git clone -b pwa2 https://github.com/pannucorp/zulip
 sudo ./scripts/setup/install --certbot --email=yuji.j@pannucorp.com --hostname=zulip-test.pannucorp.com

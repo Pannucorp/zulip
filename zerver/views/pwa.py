@@ -72,12 +72,9 @@ class ServiceWorkerView(TemplateView):
     name = 'sw.js'
 
     def get_context_data(self, **kwargs):# type: ignore[no-untyped-def] 
-        print(f'Selected response time::::::::::::::::::')
         return {
             'version': '1.0.1',
-            'icon_url': static('icons/aurss.512x512.png'),
             'manifest_url': static('manifest.json'),
-            'style_url': static('style.css'),
-            'home_url': reverse('home'),
-            'offline_url': reverse('offline'),
+            'home_url': reverse('/'),
+            'offline_url': reverse('login'),
         }
