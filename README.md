@@ -95,6 +95,7 @@ Zulip is distributed under the
 
 # Uninstall guide
 
+sudo service nginx stop
 sudo rm -rf /etc/zulip /var/log/zulip /home/zulip/* /srv/zulip-*
 
 # Install guide

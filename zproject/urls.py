@@ -216,7 +216,6 @@ from zerver.views.video_calls import (
 from zerver.views.pwa import (
     service_worker,
     manifest,
-    offline, 
     my_page, 
     say_something, 
     random_response, 
