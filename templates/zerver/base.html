@@ -3,9 +3,30 @@
     {# Base template for the whole site. #}    
     <head>
         <meta charset="UTF-8" />
-        <meta name="theme-color" content="#317EFB"/>
-        <link href="/static/images/logo/apple-touch-icon-precomposed.png" rel="apple-touch-icon" />
+        {% block meta_viewport %}
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        {% endblock %}
         <link rel="manifest" href="/manifest.json">
+        <link rel ="shortcut icon" href ="/static/icons/favicon.ico" />
+        <link id="favicon" rel="icon" href="/static/images/favicon.svg?v=4" />
+        <link rel="alternate icon" href="/static/images/favicon.png?v=4" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/static/icons/favicon-16x16.png">
+        <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32x32.png">
+
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="default">
+        <meta name="apple-mobile-web-app-title" content="PWA Splash">
+        <link rel="apple-touch-startup-image" href="/static/splash/launch-640x1136.png" media="(device-width: 320px) and (device-height: 568px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+        <link rel="apple-touch-startup-image" href="/static/splash/launch-750x1294.png" media="(device-width: 375px) and (device-height: 667px) and (-webkit-device-pixel-ratio: 2) and (orientation: portrait)">
+        <link rel="apple-touch-startup-image" href="/static/splash/launch-1242x2148.png" media="(device-width: 414px) and (device-height: 736px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+        <link rel="apple-touch-startup-image" href="/static/splash/launch-1125x2436.png" media="(device-width: 375px) and (device-height: 812px) and (-webkit-device-pixel-ratio: 3) and (orientation: portrait)">
+        <link rel="apple-touch-startup-image" href="/static/splash/launch-1536x2048.png" media="(min-device-width: 768px) and (max-device-width: 1024px) and (-webkit-min-device-pixel-ratio: 2) and (orientation: portrait)">
+        <link rel="apple-touch-startup-image" href="/static/splash/launch-1668x2224.png" media="(min-device-width: 834px) and (max-device-width: 834px) and (-webkit-min-device-pixel-ratio: 2) and (orientation: portrait)">
+        <link rel="apple-touch-startup-image" href="/static/splash/launch-2048x2732.png" media="(min-device-width: 1024px) and (max-device-width: 1024px) and (-webkit-min-device-pixel-ratio: 2) and (orientation: portrait)">
+        <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/apple-touch-icon.png">
+        <link rel="mask-icon" href="/static/icons/safari-pinned-tab.svg" color="#6F6F6F">
+        <meta name="msapplication-TileColor" content="#00aba9">
+        <meta name="theme-color" content="#ffffff">        
 
         {% block title %}
             {% if user_profile and user_profile.realm.name %}
@@ -17,12 +38,6 @@
                 <title>Zulip</title>
                 {% endif %}
             {% endif %}
-        {% endblock %}
-        <link id="favicon" rel="icon" href="/static/images/favicon.svg?v=4" />
-        <link rel="alternate icon" href="/static/images/favicon.png?v=4" />
-        <link rel ="shortcut icon" href ="#" />
-        {% block meta_viewport %}
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         {% endblock %}
         {% if not user_profile %}
         {% include 'zerver/meta_tags.html' %}

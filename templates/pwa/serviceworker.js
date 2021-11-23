@@ -1,14 +1,10 @@
 var staticCacheName = "django-pwa-v" + new Date().getTime();
 var filesToCache = [
-    '/offline/',
-    '/static/icons/icon-72x72.png',
-    '/static/icons/icon-96x96.png',
-    '/static/icons/icon-128x128.png',
-    '/static/icons/icon-144x144.png',
-    '/static/icons/icon-152x152.png',
-    '/static/icons/icon-192x192.png',
-    '/static/icons/icon-384x384.png',
-    '/static/icons/icon-512x512.png',
+    '/manifest.json',
+    '/offline',
+    '/static/icons/',
+    '/static/splash/',
+    '/static/images/',
 ];
 
 self.addEventListener("install", event => {
@@ -41,11 +37,21 @@ self.addEventListener("fetch", event => {
         caches.match(event.request)
             .then(response => {
                 console.log("fetch succeed!")
-                return response || fetch(event.request);
+
+                if (response) {
+                    return response;
+                } else {
+                    return fetch(event.request).then(function(res) {
+                        return caches.open('dynamic').then(function(cache) {
+                            cache.put(event.request.url, res.clone());
+                            return res;
+                        });
+                    });
+                }
             })
             .catch((err) => {
                 console.log("fetch failed;", err);
-                return caches.match('/offline/');
+                return caches.match('/offline');
             })
     )
 });
