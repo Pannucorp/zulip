@@ -1,57 +1,67 @@
-var staticCacheName = "django-pwa-v" + new Date().getTime();
-var filesToCache = [
+/* global caches, fetch, self */
+
+// Fill here with your cache name-version.
+const CACHE_NAME = 'my-cache-v1'
+// This is the list of URLs to be cached by your Progressive Web App.
+const CACHED_URLS = [
+    '/',
     '/manifest.json',
     '/login',
     '/static/icons/',
     '/static/splash/',
     '/static/images/',
-];
+]
 
-self.addEventListener("install", event => {
-    this.skipWaiting();
-    event.waitUntil(
-        caches.open(staticCacheName)
-            .then(cache => {
-                console.log("service workder installed!");
-                return cache.addAll(filesToCache);
-            }).catch(err=>console.log("service worker failed:", err))
-    )
-});
+// Open cache on install.
+self.addEventListener('install', event => {
+  event.waitUntil(async function () {
+    const cache = await caches.open(CACHE_NAME)
 
+    await cache.addAll(CACHED_URLS)
+  }())
+})
+
+// Cache and update with stale-while-revalidate policy.
+self.addEventListener('fetch', event => {
+  const { request } = event
+
+  // Prevent Chrome Developer Tools error:
+  // Failed to execute 'fetch' on 'ServiceWorkerGlobalScope': 'only-if-cached' can be set only with 'same-origin' mode
+  //
+  // See also https://stackoverflow.com/a/49719964/1217468
+  if (request.cache === 'only-if-cached' && request.mode !== 'same-origin') {
+    return
+  }
+
+  event.respondWith(async function () {
+    const cache = await caches.open(CACHE_NAME)
+
+    const cachedResponsePromise = await cache.match(request)
+    const networkResponsePromise = fetch(request)
+
+    if (request.url.startsWith(self.location.origin)) {
+      event.waitUntil(async function () {
+        const networkResponse = await networkResponsePromise
+
+        await cache.put(request, networkResponse.clone())
+      }())
+    }
+
+    return cachedResponsePromise || networkResponsePromise
+  }())
+})
+
+// Clean up caches other than current.
 self.addEventListener('activate', event => {
-    event.waitUntil(
-        caches.keys().then(cacheNames => {
-            console.log("service workder activated!");
-            return Promise.all(
-                cacheNames
-                    .filter(cacheName => (cacheName.startsWith("django-pwa-")))
-                    .filter(cacheName => (cacheName !== staticCacheName))
-                    .map(cacheName => caches.delete(cacheName))
-            );
-        }).catch(err=>console.log("service worker activate failed:", err))
-    );
-});
+  event.waitUntil(async function () {
+    const cacheNames = await caches.keys()
 
-self.addEventListener("fetch", event => {
-    event.respondWith(
-        caches.match(event.request)
-            .then(response => {
-                console.log("fetch succeed!")
+    await Promise.all(
+      cacheNames.filter((cacheName) => {
+        const deleteThisCache = cacheName !== CACHE_NAME
 
-                if (response) {
-                    return response;
-                } else {
-                    return fetch(event.request).then(function(res) {
-                        return caches.open('dynamic').then(function(cache) {
-                            cache.put(event.request.url, res.clone());
-                            return res;
-                        });
-                    });
-                }
-            })
-            .catch((err) => {
-                console.log("fetch failed;", err);
-                return caches.match('/login');
-            })
+        return deleteThisCache
+      }).map(cacheName => caches.delete(cacheName))
     )
-});
+  }())
+})
