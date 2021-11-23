@@ -1,7 +1,7 @@
 var staticCacheName = "django-pwa-v" + new Date().getTime();
 var filesToCache = [
     '/manifest.json',
-    '/offline',
+    '/login',
     '/static/icons/',
     '/static/splash/',
     '/static/images/',
@@ -51,7 +51,7 @@ self.addEventListener("fetch", event => {
             })
             .catch((err) => {
                 console.log("fetch failed;", err);
-                return caches.match('/offline');
+                return caches.match('/login');
             })
     )
 });

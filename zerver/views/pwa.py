@@ -23,10 +23,6 @@ def manifest(request):# type: ignore[no-untyped-def]
         if setting_name.startswith('PWA_')
     }, content_type='application/json')
 
-def offline(request):# type: ignore[no-untyped-def] 
-    return render(request, 'pwa/offline.html')
-
-
 def my_page(request):# type: ignore[no-untyped-def] 
     routes = {
         'Home': reverse('home'),
