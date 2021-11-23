@@ -92,3 +92,11 @@ Zulip is distributed under the
    tools/ci/build-docker-images
 2. push->github action: production-suite, zulip-ci
    workflows/production-suite
+
+# Uninstall guide
+
+sudo rm -rf /etc/zulip /var/log/zulip /home/zulip/* /srv/zulip-*
+
+# Install guide
+
+sudo ./scripts/setup/install --certbot --email=yuji.j@pannucorp.com --hostname=zulip-test.pannucorp.com
