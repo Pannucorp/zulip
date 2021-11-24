@@ -1,34 +1,28 @@
-/* global caches, fetch, self */
-
-// Fill here with your cache name-version.
-const CACHE_NAME = 'my-cache-v1'
-// This is the list of URLs to be cached by your Progressive Web App.
-const CACHED_URLS = [
-    '/',
+const CACHE_NAME = 'PannuCorp-1.0.0'    
+const appShell = [
     '/manifest.json',
-    '/login',
-    '/static/icons/',
-    '/static/splash/',
-    '/static/images/',
-]
+    '/static/icons/icon-72x72.png',
+    '/static/icons/icon-96x96.png',
+    '/static/icons/icon-128x128.png',
+    '/static/icons/icon-144x144.png',
+    '/static/icons/icon-152x152.png',
+    '/static/icons/icon-192x192.png',
+    '/static/icons/icon-384x384.png',
+    '/static/icons/icon-512x512.png',
+    '/static/icons/android-chrome-192x192.png',
+    '/static/icons/android-chrome-512x512.png'
+];
 
-// Open cache on install.
-self.addEventListener('install', event => {
-  event.waitUntil(async function () {
-    const cache = await caches.open(CACHE_NAME)
+addEventListener('install', (event) => {
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.addAll(appShell);
+  })());
+});
 
-    await cache.addAll(CACHED_URLS)
-  }())
-})
-
-// Cache and update with stale-while-revalidate policy.
 self.addEventListener('fetch', event => {
   const { request } = event
 
-  // Prevent Chrome Developer Tools error:
-  // Failed to execute 'fetch' on 'ServiceWorkerGlobalScope': 'only-if-cached' can be set only with 'same-origin' mode
-  //
-  // See also https://stackoverflow.com/a/49719964/1217468
   if (request.cache === 'only-if-cached' && request.mode !== 'same-origin') {
     return
   }
@@ -51,7 +45,6 @@ self.addEventListener('fetch', event => {
   }())
 })
 
-// Clean up caches other than current.
 self.addEventListener('activate', event => {
   event.waitUntil(async function () {
     const cacheNames = await caches.keys()

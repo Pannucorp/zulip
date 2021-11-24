@@ -220,8 +220,7 @@ from zerver.views.pwa import (
     say_something, 
     random_response, 
     fill_dynamic_cache, 
-    must_not_cache,
-    ServiceWorkerView
+    must_not_cache   
 )
     
 from zerver.views.zephyr import webathena_kerberos_login

@@ -64,17 +64,3 @@ def fill_dynamic_cache(request, id):# type: ignore[no-untyped-def]
 @never_cache
 def must_not_cache(request):# type: ignore[no-untyped-def] 
     return render(request, 'pwa/must_not_cache.html', context={'requested_at': timezone.now()})
-
-
-class ServiceWorkerView(TemplateView):
-    template_name = 'sw.js'
-    content_type = 'application/javascript'
-    name = 'sw.js'
-
-    def get_context_data(self, **kwargs):# type: ignore[no-untyped-def] 
-        return {
-            'version': '1.0.1',
-            'manifest_url': static('manifest.json'),
-            'home_url': reverse('/'),
-            'offline_url': reverse('login'),
-        }
