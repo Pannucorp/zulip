@@ -13,11 +13,26 @@ const appShell = [
     '/static/icons/android-chrome-512x512.png'
 ];
 
-addEventListener('install', (event) => {
+let deferredPrompt;
+
+self.addEventListener('beforeinstallprompt', event => {
+  event.preventDefault();
+  deferredPrompt = event;
+  // showInstallPromotion();
+  console.log(`'beforeinstallprompt' event was fired.`);
+});
+
+self.addEventListener('install', event => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_NAME);
     await cache.addAll(appShell);
   })());
+});
+
+self.addEventListener('appinstalled',() => {
+  // hideInstallPromotion();
+  deferredPrompt = null;
+  console.log('PWA was installed');
 });
 
 self.addEventListener('fetch', event => {
@@ -58,3 +73,12 @@ self.addEventListener('activate', event => {
     )
   }())
 })
+
+self.addEventListener('push', event => {
+  const payload = event.data ? event.data.text() : 'no payload';
+  event.waitUntil(
+    self.registration.showNotification('ServiceWorker Cookbook', {
+      body: payload,
+    })
+  );
+});

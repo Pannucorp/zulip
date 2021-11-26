@@ -28,6 +28,16 @@
         <meta name="msapplication-TileColor" content="#00aba9">
         <meta name="theme-color" content="#ffffff">        
 
+        <script type="application/ld+json">
+            {
+                "@context": "https://schema.org",
+                "@type": "WebApplication",
+                "name": "PannuCorp",
+                "applicationCategory": "https://schema.org/WebApplication",
+                "keywords": "pannucorp, zulip, health, pwa",
+            }
+        </script>
+
         {% block title %}
             {% if user_profile and user_profile.realm.name %}
                 <title>{{user_profile.realm.name}} - Zulip</title>
