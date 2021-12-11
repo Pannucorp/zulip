@@ -1,13 +1,27 @@
 {
     "name": "PannuCorp",
     "short_name": "pannucorp",
-    "description": "PannuCorp WebSite",
-    "theme_color": "#ffffff",
-    "background_color": "#ffffff",
+    "description": "PannuCorp WebSite",    
+    "manifest_package": "org.chromium.webapk.test",
+    "scope": "https://zulip-test.pannucorp.com/",
+    "start_url": "https://zulip-test.pannucorp.com/#",
+    "intent_filters": {
+      "scope_url_scheme": "https",
+      "scope_url_host": "zulip-test.pannucorp.com",
+      "scope_url_path": "/"
+    },    
     "display": "standalone",
     "orientation": "portrait",
-    "scope": "./",
-    "start_url": "./",
+    "theme_color": "2147483648L",
+    "background_color": "2147483648L",
+    "icon_urls_and_icon_murmur2_hashes": "https://zulip-test.pannucorp.com/static/icons/icon-72x72.png 0 https://zulip-test.pannucorp.com/static/icons/icon-96x96.png 0",
+    "web_manifest_url": "https://zulip-test.pannucorp.com/manifest.json",
+    "version_code": "1",
+    "version_name": "1.0",
+    "bound_webapk": {
+      "runtime_host": "org.chromium.chrome",
+      "runtime_host_application_name": "Chromium"
+    },
     "icons": [
       {
         "src": "/static/icons/icon-72x72.png",
