@@ -1,3 +1,4 @@
+from email.headerregistry import Address
 from typing import Callable, Dict, Optional, Set, Tuple
 
 from django.core import validators
@@ -7,27 +8,23 @@ from django.utils.translation import gettext as _
 from zerver.lib.name_restrictions import is_disposable_domain
 
 # TODO: Move DisposableEmailError, etc. into here.
-from zerver.models import (
+from zerver.models import Realm, RealmDomain
+from zerver.models.realms import (
     DisposableEmailError,
     DomainNotAllowedForRealmError,
     EmailContainsPlusError,
-    Realm,
-    RealmDomain,
-    email_to_domain,
-    email_to_username,
-    get_users_by_delivery_email,
-    is_cross_realm_bot_email,
 )
+from zerver.models.users import get_users_by_delivery_email, is_cross_realm_bot_email
 
 
 def validate_disposable(email: str) -> None:
-    if is_disposable_domain(email_to_domain(email)):
+    if is_disposable_domain(Address(addr_spec=email).domain):
         raise DisposableEmailError
 
 
 def get_realm_email_validator(realm: Realm) -> Callable[[str], None]:
     if not realm.emails_restricted_to_domains:
-        # Should we also do '+' check for non-resticted realms?
+        # Should we also do '+' check for non-restricted realms?
         if realm.disallow_disposable_email_addresses:
             return validate_disposable
 
@@ -59,10 +56,11 @@ def get_realm_email_validator(realm: Realm) -> Callable[[str], None]:
         a small whitelist.
         """
 
-        if "+" in email_to_username(email):
+        address = Address(addr_spec=email)
+        if "+" in address.username:
             raise EmailContainsPlusError
 
-        domain = email_to_domain(email)
+        domain = address.domain.lower()
 
         if domain in allowed_domains:
             return
@@ -94,7 +92,6 @@ def validate_email_is_valid(
     email: str,
     validate_email_allowed_in_realm: Callable[[str], None],
 ) -> Optional[str]:
-
     try:
         validators.validate_email(email)
     except ValidationError:

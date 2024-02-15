@@ -69,11 +69,11 @@ Usually, this list of users is one of 3 things:
   like new realm emoji).
 - Everyone who would receive a given message (for messages, emoji
   reactions, message editing, etc.); i.e. the subscribers to a stream
-  or the people on a private message thread.
+  or the people on a direct message thread.
 
 It is the responsibility of the caller of `send_event` to choose the
 list of user IDs correctly. There can be security problems if e.g. an
-event containing private message content is sent to the entire
+event containing direct message content is sent to the entire
 organization. However, if an event isn't sent to enough clients,
 there will likely be user-visible real-time sync bugs.
 
@@ -162,7 +162,7 @@ its data, clients would recover, just as if they had lost Internet
 access briefly (there is some DoS risk to manage, though).
 
 Note that the garbage-collection system has hooks that are important
-for the implementation of [notifications](../subsystems/notifications.md).
+for the implementation of [notifications](notifications.md).
 
 (The event queue server is designed to save any event queues to disk
 and reload them when the server is restarted, and catches exceptions
@@ -304,7 +304,7 @@ There are some notable optional parameters for `verify_action`:
   doesn't actually require state changes for some reason; otherwise,
   `verify_action` will complain that your test doesn't really
   exercise any `apply_events` logic. Typing notifications (which
-  are ephemereal) are a common place where we use this.
+  are ephemeral) are a common place where we use this.
 
 - `num_events` will tell `verify_action` how many events the
   `hamlet` user will receive after the action (the default is 1).
@@ -376,9 +376,9 @@ node test fixtures and our OpenAPI documentation.
 #### Node testing
 
 Once you've completed backend testing, be sure to add an example event
-in `frontend_tests/node_tests/lib/events.js`, a test of the
+in `web/tests/lib/events.js`, a test of the
 `server_events_dispatch.js` code for that event in
-`frontend_tests/node_tests/dispatch.js`, and verify your example
+`web/tests/dispatch.test.js`, and verify your example
 against the two versions of the schema that you declared above using
 `tools/check-schemas`.
 
@@ -407,7 +407,7 @@ correctly, clients are responsible for discarding events related to
 messages that the client has not yet fetched.
 
 Additionally, see
-[the main documentation on sending messages](../subsystems/sending-messages.md).
+[the main documentation on sending messages](sending-messages.md).
 
 ## Schema changes
 

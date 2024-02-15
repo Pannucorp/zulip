@@ -1,14 +1,16 @@
 import re
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import orjson
 from django.core.exceptions import ValidationError
-from django.http import HttpResponse
 
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.validator import check_widget_content
 from zerver.lib.widget import get_widget_data, get_widget_type
 from zerver.models import SubMessage, UserProfile
+
+if TYPE_CHECKING:
+    from django.test.client import _MonkeyPatchedWSGIResponse as TestHttpResponse
 
 
 class WidgetContentTestCase(ZulipTestCase):
@@ -64,8 +66,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content="whatever",
         )
@@ -96,8 +97,11 @@ class WidgetContentTestCase(ZulipTestCase):
         for message in test_messages:
             self.assertEqual(get_widget_data(content=message), (None, None))
 
-        # Add a positive check for context
+        # Add positive checks for context
         self.assertEqual(get_widget_data(content="/todo"), ("todo", None))
+        self.assertEqual(get_widget_data(content="/todo ignore"), ("todo", None))
+        # Test tokenization on newline character
+        self.assertEqual(get_widget_data(content="/todo\nignore"), ("todo", None))
 
     def test_explicit_widget_content(self) -> None:
         # Users can send widget_content directly on messages
@@ -121,8 +125,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content=content,
             widget_content=orjson.dumps(widget_content).decode(),
@@ -152,8 +155,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content=content,
         )
@@ -181,8 +183,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content=content,
         )
@@ -233,8 +234,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content=content,
         )
@@ -243,7 +243,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         message = self.get_last_message()
 
-        def post(sender: UserProfile, data: Dict[str, object]) -> HttpResponse:
+        def post(sender: UserProfile, data: Dict[str, object]) -> "TestHttpResponse":
             payload = dict(
                 message_id=message.id, msg_type="widget", content=orjson.dumps(data).decode()
             )
@@ -262,8 +262,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content=content,
         )
@@ -272,7 +271,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         message = self.get_last_message()
 
-        def post_submessage(content: str) -> HttpResponse:
+        def post_submessage(content: str) -> "TestHttpResponse":
             payload = dict(
                 message_id=message.id,
                 msg_type="widget",
@@ -321,8 +320,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content=content,
         )
@@ -331,7 +329,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         message = self.get_last_message()
 
-        def post_submessage(content: str) -> HttpResponse:
+        def post_submessage(content: str) -> "TestHttpResponse":
             payload = dict(
                 message_id=message.id,
                 msg_type="widget",
@@ -379,8 +377,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         payload = dict(
             type="stream",
-            to=stream_name,
-            client="test suite",
+            to=orjson.dumps(stream_name).decode(),
             topic="whatever",
             content=content,
         )
@@ -393,7 +390,7 @@ class WidgetContentTestCase(ZulipTestCase):
 
         self.assertEqual(get_widget_type(message_id=message.id), "poll")
 
-        submessage.content = "bogus non json"
+        submessage.content = "bogus non-json"
         submessage.save()
         self.assertEqual(get_widget_type(message_id=message.id), None)
 

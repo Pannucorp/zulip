@@ -1,37 +1,43 @@
-import datetime
 import logging
-import multiprocessing
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from mimetypes import guess_type
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import bmemcached
 import orjson
 from bs4 import BeautifulSoup
 from django.conf import settings
 from django.core.cache import cache
-from django.db import connection
+from django.core.validators import validate_email
+from django.db import connection, transaction
 from django.utils.timezone import now as timezone_now
 from psycopg2.extras import execute_values
 from psycopg2.sql import SQL, Identifier
 
 from analytics.models import RealmCount, StreamCount, UserCount
-from zerver.lib.actions import (
-    UserMessageLite,
-    bulk_insert_ums,
-    do_change_avatar_fields,
-    do_change_plan_type,
-)
+from zerver.actions.create_realm import set_default_for_realm_permission_group_settings
+from zerver.actions.realm_settings import do_change_realm_plan_type
+from zerver.actions.user_settings import do_change_avatar_fields
 from zerver.lib.avatar_hash import user_avatar_path_from_ids
-from zerver.lib.bulk_create import bulk_create_users, bulk_set_users_or_streams_recipient_fields
+from zerver.lib.bulk_create import bulk_set_users_or_streams_recipient_fields
 from zerver.lib.export import DATE_FIELDS, Field, Path, Record, TableData, TableName
 from zerver.lib.markdown import markdown_convert
 from zerver.lib.markdown import version as markdown_version
 from zerver.lib.message import get_last_message_id
+from zerver.lib.push_notifications import sends_notifications_directly
+from zerver.lib.remote_server import maybe_enqueue_audit_log_upload
 from zerver.lib.server_initialization import create_internal_realm, server_initialized
 from zerver.lib.streams import render_stream_description
 from zerver.lib.timestamp import datetime_to_timestamp
-from zerver.lib.upload import BadImageError, get_bucket, sanitize_name, upload_backend
+from zerver.lib.upload import upload_backend
+from zerver.lib.upload.base import BadImageError, sanitize_name
+from zerver.lib.upload.s3 import get_bucket
+from zerver.lib.user_counts import realm_user_count_by_role
+from zerver.lib.user_groups import create_system_user_groups_for_realm
+from zerver.lib.user_message import UserMessageLite, bulk_insert_ums
 from zerver.lib.utils import generate_api_key, process_list_in_batches
 from zerver.models import (
     AlertWord,
@@ -46,15 +52,18 @@ from zerver.models import (
     Huddle,
     Message,
     MutedUser,
+    OnboardingStep,
     Reaction,
     Realm,
     RealmAuditLog,
+    RealmAuthenticationMethod,
     RealmDomain,
     RealmEmoji,
     RealmFilter,
     RealmPlayground,
     RealmUserDefault,
     Recipient,
+    ScheduledMessage,
     Service,
     Stream,
     Subscription,
@@ -62,18 +71,19 @@ from zerver.models import (
     UserActivityInterval,
     UserGroup,
     UserGroupMembership,
-    UserHotspot,
     UserMessage,
     UserPresence,
     UserProfile,
+    UserStatus,
     UserTopic,
-    get_huddle_hash,
-    get_realm,
-    get_system_bot,
-    get_user_profile_by_id,
 )
+from zerver.models.groups import SystemGroups
+from zerver.models.realms import get_realm
+from zerver.models.recipients import get_huddle_hash
+from zerver.models.users import get_system_bot, get_user_profile_by_id
 
 realm_tables = [
+    ("zerver_realmauthenticationmethod", RealmAuthenticationMethod, "realmauthenticationmethod"),
     ("zerver_defaultstream", DefaultStream, "defaultstream"),
     ("zerver_realmemoji", RealmEmoji, "realmemoji"),
     ("zerver_realmdomain", RealmDomain, "realmdomain"),
@@ -101,13 +111,16 @@ ID_MAP: Dict[str, Dict[int, int]] = {
     "recipient": {},
     "subscription": {},
     "defaultstream": {},
+    "onboardingstep": {},
     "reaction": {},
+    "realmauthenticationmethod": {},
     "realmemoji": {},
     "realmdomain": {},
     "realmfilter": {},
     "realmplayground": {},
     "message": {},
     "user_presence": {},
+    "userstatus": {},
     "useractivity": {},
     "useractivityinterval": {},
     "usermessage": {},
@@ -116,7 +129,6 @@ ID_MAP: Dict[str, Dict[int, int]] = {
     "attachment": {},
     "realmauditlog": {},
     "recipient_to_huddle_map": {},
-    "userhotspot": {},
     "usertopic": {},
     "muteduser": {},
     "service": {},
@@ -129,6 +141,7 @@ ID_MAP: Dict[str, Dict[int, int]] = {
     "analytics_streamcount": {},
     "analytics_usercount": {},
     "realmuserdefault": {},
+    "scheduledmessage": {},
 }
 
 id_map_to_list: Dict[str, Dict[int, List[int]]] = {
@@ -156,9 +169,7 @@ def fix_datetime_fields(data: TableData, table: TableName) -> None:
     for item in data[table]:
         for field_name in DATE_FIELDS[table]:
             if item[field_name] is not None:
-                item[field_name] = datetime.datetime.fromtimestamp(
-                    item[field_name], tz=datetime.timezone.utc
-                )
+                item[field_name] = datetime.fromtimestamp(item[field_name], tz=timezone.utc)
 
 
 def fix_upload_links(data: TableData, message_table: TableName) -> None:
@@ -177,6 +188,15 @@ def fix_upload_links(data: TableData, message_table: TableName) -> None:
                         message["rendered_content"] = message["rendered_content"].replace(
                             key, value
                         )
+
+
+def fix_streams_can_remove_subscribers_group_column(data: TableData, realm: Realm) -> None:
+    table = get_db_table(Stream)
+    admins_group = UserGroup.objects.get(
+        name=SystemGroups.ADMINISTRATORS, realm=realm, is_system_group=True
+    )
+    for stream in data[table]:
+        stream["can_remove_subscribers_group"] = admins_group
 
 
 def create_subscription_events(data: TableData, realm_id: int) -> None:
@@ -260,13 +280,14 @@ def fix_customprofilefield(data: TableData) -> None:
     In CustomProfileField with 'field_type' like 'USER', the IDs need to be
     re-mapped.
     """
-    field_type_USER_id_list = []
-    for item in data["zerver_customprofilefield"]:
-        if item["field_type"] == CustomProfileField.USER:
-            field_type_USER_id_list.append(item["id"])
+    field_type_USER_ids = {
+        item["id"]
+        for item in data["zerver_customprofilefield"]
+        if item["field_type"] == CustomProfileField.USER
+    }
 
     for item in data["zerver_customprofilefieldvalue"]:
-        if item["field_id"] in field_type_USER_id_list:
+        if item["field_id"] in field_type_USER_ids:
             old_user_id_list = orjson.loads(item["value"])
 
             new_id_list = re_map_foreign_keys_many_to_many_internal(
@@ -355,7 +376,10 @@ def fix_message_rendered_content(
             ).rendered_content
 
             message["rendered_content"] = rendered_content
-            message["rendered_content_version"] = markdown_version
+            if "scheduled_timestamp" not in message:
+                # This logic runs also for ScheduledMessage, which doesn't use
+                # the rendered_content_version field.
+                message["rendered_content_version"] = markdown_version
         except Exception:
             # This generally happens with two possible causes:
             # * rendering Markdown throwing an uncaught exception
@@ -371,10 +395,7 @@ def current_table_ids(data: TableData, table: TableName) -> List[int]:
     """
     Returns the ids present in the current table
     """
-    id_list = []
-    for item in data[table]:
-        id_list.append(item["id"])
-    return id_list
+    return [item["id"] for item in data[table]]
 
 
 def idseq(model_class: Any) -> str:
@@ -427,7 +448,6 @@ def re_map_foreign_keys(
     verbose: bool = False,
     id_field: bool = False,
     recipient_field: bool = False,
-    reaction_field: bool = False,
 ) -> None:
     """
     This is a wrapper function for all the realm data tables
@@ -447,7 +467,6 @@ def re_map_foreign_keys(
         verbose,
         id_field,
         recipient_field,
-        reaction_field,
     )
 
 
@@ -459,7 +478,6 @@ def re_map_foreign_keys_internal(
     verbose: bool = False,
     id_field: bool = False,
     recipient_field: bool = False,
-    reaction_field: bool = False,
 ) -> None:
     """
     We occasionally need to assign new ids to rows during the
@@ -487,11 +505,6 @@ def re_map_foreign_keys_internal(
             else:
                 continue
         old_id = item[field_name]
-        if reaction_field:
-            if item["reaction_type"] == Reaction.REALM_EMOJI:
-                old_id = int(old_id)
-            else:
-                continue
         if old_id in lookup_table:
             new_id = lookup_table[old_id]
             if verbose:
@@ -504,10 +517,36 @@ def re_map_foreign_keys_internal(
             item[field_name + "_id"] = new_id
             del item[field_name]
         else:
-            if reaction_field:
-                item[field_name] = str(new_id)
-            else:
-                item[field_name] = new_id
+            item[field_name] = new_id
+
+
+def re_map_realm_emoji_codes(data: TableData, *, table_name: str) -> None:
+    """
+    Some tables, including Reaction and UserStatus, contain a form of
+    foreign key reference to the RealmEmoji table in the form of
+    `str(realm_emoji.id)` when `reaction_type="realm_emoji"`.
+
+    See the block comment for emoji_code in the AbstractEmoji
+    definition for more details.
+    """
+    realm_emoji_dct = {}
+
+    for row in data["zerver_realmemoji"]:
+        realm_emoji_dct[row["id"]] = row
+
+    for row in data[table_name]:
+        if row["reaction_type"] == Reaction.REALM_EMOJI:
+            old_realm_emoji_id = int(row["emoji_code"])
+
+            # Fail hard here if we didn't map correctly here
+            new_realm_emoji_id = ID_MAP["realmemoji"][old_realm_emoji_id]
+
+            # This is a very important sanity check.
+            realm_emoji_row = realm_emoji_dct[new_realm_emoji_id]
+            assert realm_emoji_row["name"] == row["emoji_name"]
+
+            # Now update emoji_code to the new id.
+            row["emoji_code"] = str(new_realm_emoji_id)
 
 
 def re_map_foreign_keys_many_to_many(
@@ -567,14 +606,6 @@ def fix_bitfield_keys(data: TableData, table: TableName, field_name: Field) -> N
         del item[field_name + "_mask"]
 
 
-def fix_realm_authentication_bitfield(data: TableData, table: TableName, field_name: Field) -> None:
-    """Used to fixup the authentication_methods bitfield to be a string"""
-    for item in data[table]:
-        values_as_bitstring = "".join("1" if field[1] else "0" for field in item[field_name])
-        values_as_int = int(values_as_bitstring, 2)
-        item[field_name] = values_as_int
-
-
 def remove_denormalized_recipient_column_from_data(data: TableData) -> None:
     """
     The recipient column shouldn't be imported, we'll set the correct values
@@ -602,7 +633,7 @@ def update_model_ids(model: Any, data: TableData, related_table: TableName) -> N
     table = get_db_table(model)
 
     # Important: remapping usermessage rows is
-    # not only unnessary, it's expensive and can cause
+    # not only unnecessary, it's expensive and can cause
     # memory errors. We don't even use ids from ID_MAP.
     assert "usermessage" not in table
 
@@ -689,11 +720,9 @@ def process_avatars(record: Dict[str, Any]) -> None:
 
     if record["s3_path"].endswith(".original"):
         user_profile = get_user_profile_by_id(record["user_profile_id"])
-        if settings.LOCAL_UPLOADS_DIR is not None:
+        if settings.LOCAL_AVATARS_DIR is not None:
             avatar_path = user_avatar_path_from_ids(user_profile.id, record["realm_id"])
-            medium_file_path = (
-                os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars", avatar_path) + "-medium.png"
-            )
+            medium_file_path = os.path.join(settings.LOCAL_AVATARS_DIR, avatar_path) + "-medium.png"
             if os.path.exists(medium_file_path):
                 # We remove the image here primarily to deal with
                 # issues when running the import script multiple
@@ -719,6 +748,7 @@ def import_uploads(
     realm: Realm,
     import_dir: Path,
     processes: int,
+    default_user_profile_id: Optional[int] = None,
     processing_avatars: bool = False,
     processing_emojis: bool = False,
     processing_realm_icons: bool = False,
@@ -756,12 +786,7 @@ def import_uploads(
             bucket_name = settings.S3_AUTH_UPLOADS_BUCKET
         bucket = get_bucket(bucket_name)
 
-    count = 0
-    for record in records:
-        count += 1
-        if count % 1000 == 0:
-            logging.info("Processed %s/%s uploads", count, len(records))
-
+    for count, record in enumerate(records, 1):
         if processing_avatars:
             # For avatars, we need to rehash the user ID with the
             # new server's avatar salt
@@ -797,14 +822,17 @@ def import_uploads(
         if s3_uploads:
             key = bucket.Object(relative_path)
             metadata = {}
-            if processing_emojis and "user_profile_id" not in record:
-                # Exported custom emoji from tools like Slack don't have
-                # the data for what user uploaded them in `user_profile_id`.
-                pass
-            elif processing_realm_icons and "user_profile_id" not in record:
-                # Exported realm icons and logos from local export don't have
-                # the value of user_profile_id in the associated record.
-                pass
+            if "user_profile_id" not in record:
+                # This should never happen for uploads or avatars; if
+                # so, it is an error, default_user_profile_id will be
+                # None, and we assert.  For emoji / realm icons, we
+                # fall back to default_user_profile_id.
+                # default_user_profile_id can be None in Gitter
+                # imports, which do not create any owners; but Gitter
+                # does not have emoji which we would need to allocate
+                # a user to.
+                assert default_user_profile_id is not None
+                metadata["user_profile_id"] = str(default_user_profile_id)
             else:
                 user_profile_id = int(record["user_profile_id"])
                 # Support email gateway bot and other cross-realm messages
@@ -835,13 +863,18 @@ def import_uploads(
             )
         else:
             assert settings.LOCAL_UPLOADS_DIR is not None
+            assert settings.LOCAL_AVATARS_DIR is not None
+            assert settings.LOCAL_FILES_DIR is not None
             if processing_avatars or processing_emojis or processing_realm_icons:
-                file_path = os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars", relative_path)
+                file_path = os.path.join(settings.LOCAL_AVATARS_DIR, relative_path)
             else:
-                file_path = os.path.join(settings.LOCAL_UPLOADS_DIR, "files", relative_path)
+                file_path = os.path.join(settings.LOCAL_FILES_DIR, relative_path)
             orig_file_path = os.path.join(import_dir, record["path"])
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             shutil.copy(orig_file_path, file_path)
+
+        if count % 1000 == 0:
+            logging.info("Processed %s/%s uploads", count, len(records))
 
     if processing_avatars:
         # Ensure that we have medium-size avatar images for every
@@ -854,21 +887,31 @@ def import_uploads(
                 process_avatars(record)
         else:
             connection.close()
-            cache._cache.disconnect_all()
-            with multiprocessing.Pool(processes) as p:
-                for out in p.imap_unordered(process_avatars, records):
-                    pass
+            _cache = cache._cache  # type: ignore[attr-defined] # not in stubs
+            assert isinstance(_cache, bmemcached.Client)
+            _cache.disconnect_all()
+            with ProcessPoolExecutor(max_workers=processes) as executor:
+                for future in as_completed(
+                    executor.submit(process_avatars, record) for record in records
+                ):
+                    future.result()
 
 
 # Importing data suffers from a difficult ordering problem because of
 # models that reference each other circularly.  Here is a correct order.
 #
+# (Note that this list is not exhaustive and only talks about the main,
+# most important models. There's a bunch of minor models that are handled
+# separately and not mentioned here - but following the principle that we
+# have to import the dependencies first.)
+#
 # * Client [no deps]
-# * Realm [-notifications_stream]
+# * Realm [-notifications_stream,-group_permissions]
+# * UserGroup
 # * Stream [only depends on realm]
-# * Realm's notifications_stream
-# * Now can do all realm_tables
+# * Realm's notifications_stream and group_permissions
 # * UserProfile, in order by ID to avoid bot loop issues
+# * Now can do all realm_tables
 # * Huddle
 # * Recipient
 # * Subscription
@@ -893,52 +936,88 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
     logging.info("Importing realm data from %s", realm_data_filename)
     with open(realm_data_filename, "rb") as f:
         data = orjson.loads(f.read())
+
+    # Merge in zerver_userprofile_mirrordummy
+    data["zerver_userprofile"] = data["zerver_userprofile"] + data["zerver_userprofile_mirrordummy"]
+    del data["zerver_userprofile_mirrordummy"]
+    data["zerver_userprofile"].sort(key=lambda r: r["id"])
+
     remove_denormalized_recipient_column_from_data(data)
 
     sort_by_date = data.get("sort_by_date", False)
 
     bulk_import_client(data, Client, "zerver_client")
 
-    # We don't import the Stream model yet, since it depends on Realm,
-    # which isn't imported yet.  But we need the Stream model IDs for
-    # notifications_stream.
+    # We don't import the Stream and UserGroup models yet, since
+    # they depend on Realm, which isn't imported yet.
+    # But we need the Stream and UserGroup model IDs for
+    # notifications_stream and group permissions, respectively
     update_model_ids(Stream, data, "stream")
     re_map_foreign_keys(data, "zerver_realm", "notifications_stream", related_table="stream")
     re_map_foreign_keys(data, "zerver_realm", "signup_notifications_stream", related_table="stream")
+    if "zerver_usergroup" in data:
+        update_model_ids(UserGroup, data, "usergroup")
+        for setting_name in Realm.REALM_PERMISSION_GROUP_SETTINGS:
+            re_map_foreign_keys(data, "zerver_realm", setting_name, related_table="usergroup")
 
     fix_datetime_fields(data, "zerver_realm")
     # Fix realm subdomain information
     data["zerver_realm"][0]["string_id"] = subdomain
     data["zerver_realm"][0]["name"] = subdomain
-    fix_realm_authentication_bitfield(data, "zerver_realm", "authentication_methods")
     update_model_ids(Realm, data, "realm")
 
-    realm = Realm(**data["zerver_realm"][0])
+    # Create the realm, but mark it deactivated for now, while we
+    # import the supporting data structures, which may take a bit.
+    realm_properties = dict(**data["zerver_realm"][0])
+    realm_properties["deactivated"] = True
 
-    if realm.notifications_stream_id is not None:
-        notifications_stream_id: Optional[int] = int(realm.notifications_stream_id)
-    else:
-        notifications_stream_id = None
-    realm.notifications_stream_id = None
-    if realm.signup_notifications_stream_id is not None:
-        signup_notifications_stream_id: Optional[int] = int(realm.signup_notifications_stream_id)
-    else:
-        signup_notifications_stream_id = None
-    realm.signup_notifications_stream_id = None
-    realm.save()
+    # Initialize whether we expect push notifications to work.
+    realm_properties["push_notifications_enabled"] = sends_notifications_directly()
 
-    # Email tokens will automatically be randomly generated when the
-    # Stream objects are created by Django.
-    fix_datetime_fields(data, "zerver_stream")
-    re_map_foreign_keys(data, "zerver_stream", "realm", related_table="realm")
-    # Handle rendering of stream descriptions for import from non-Zulip
-    for stream in data["zerver_stream"]:
-        stream["rendered_description"] = render_stream_description(stream["description"])
-    bulk_import_model(data, Stream)
+    with transaction.atomic(durable=True):
+        realm = Realm(**realm_properties)
+        if "zerver_usergroup" not in data:
+            # For now a dummy value of -1 is given to groups fields which
+            # is changed later before the transaction is committed.
+            for permission_configuration in Realm.REALM_PERMISSION_GROUP_SETTINGS.values():
+                setattr(realm, permission_configuration.id_field_name, -1)
 
-    realm.notifications_stream_id = notifications_stream_id
-    realm.signup_notifications_stream_id = signup_notifications_stream_id
-    realm.save()
+        realm.save()
+
+        if "zerver_usergroup" in data:
+            re_map_foreign_keys(data, "zerver_usergroup", "realm", related_table="realm")
+            for setting_name in UserGroup.GROUP_PERMISSION_SETTINGS:
+                re_map_foreign_keys(
+                    data, "zerver_usergroup", setting_name, related_table="usergroup"
+                )
+            bulk_import_model(data, UserGroup)
+
+        # We expect Zulip server exports to contain these system groups,
+        # this logic here is needed to handle the imports from other services.
+        role_system_groups_dict: Optional[Dict[int, UserGroup]] = None
+        if "zerver_usergroup" not in data:
+            role_system_groups_dict = create_system_user_groups_for_realm(realm)
+
+        # Email tokens will automatically be randomly generated when the
+        # Stream objects are created by Django.
+        fix_datetime_fields(data, "zerver_stream")
+        re_map_foreign_keys(data, "zerver_stream", "realm", related_table="realm")
+        if role_system_groups_dict is not None:
+            # Because the system user groups are missing, we manually set up
+            # the defaults for can_remove_subscribers_group for all the
+            # streams.
+            fix_streams_can_remove_subscribers_group_column(data, realm)
+        else:
+            re_map_foreign_keys(
+                data, "zerver_stream", "can_remove_subscribers_group", related_table="usergroup"
+            )
+        # Handle rendering of stream descriptions for import from non-Zulip
+        for stream in data["zerver_stream"]:
+            stream["rendered_description"] = render_stream_description(stream["description"], realm)
+        bulk_import_model(data, Stream)
+
+        if "zerver_usergroup" not in data:
+            set_default_for_realm_permission_group_settings(realm)
 
     # Remap the user IDs for notification_bot and friends to their
     # appropriate IDs on this server
@@ -953,11 +1032,6 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
         update_id_map(table="user_profile", old_id=item["id"], new_id=new_user_id)
         new_recipient_id = Recipient.objects.get(type=Recipient.PERSONAL, type_id=new_user_id).id
         update_id_map(table="recipient", old_id=item["recipient_id"], new_id=new_recipient_id)
-
-    # Merge in zerver_userprofile_mirrordummy
-    data["zerver_userprofile"] = data["zerver_userprofile"] + data["zerver_userprofile_mirrordummy"]
-    del data["zerver_userprofile_mirrordummy"]
-    data["zerver_userprofile"].sort(key=lambda r: r["id"])
 
     # To remap foreign key for UserProfile.last_active_message_id
     update_message_foreign_keys(import_dir=import_dir, sort_by_date=sort_by_date)
@@ -988,15 +1062,34 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
 
     user_profiles = [UserProfile(**item) for item in data["zerver_userprofile"]]
     for user_profile in user_profiles:
+        # Validate both email attributes to be defensive
+        # against any malformed data, where .delivery_email
+        # might be set correctly, but .email not.
+        validate_email(user_profile.delivery_email)
+        validate_email(user_profile.email)
         user_profile.set_unusable_password()
+        user_profile.tos_version = UserProfile.TOS_VERSION_BEFORE_FIRST_LOGIN
     UserProfile.objects.bulk_create(user_profiles)
 
     re_map_foreign_keys(data, "zerver_defaultstream", "stream", related_table="stream")
     re_map_foreign_keys(data, "zerver_realmemoji", "author", related_table="user_profile")
-    for (table, model, related_table) in realm_tables:
+    for table, model, related_table in realm_tables:
         re_map_foreign_keys(data, table, "realm", related_table="realm")
         update_model_ids(model, data, related_table)
         bulk_import_model(data, model)
+
+    # Ensure RealmEmoji get the .author set to a reasonable default, if the value
+    # wasn't provided in the import data.
+    first_user_profile = (
+        UserProfile.objects.filter(realm=realm, is_active=True, role=UserProfile.ROLE_REALM_OWNER)
+        .order_by("id")
+        .first()
+    )
+    for realm_emoji in RealmEmoji.objects.filter(realm=realm):
+        if realm_emoji.author_id is None:
+            assert first_user_profile is not None
+            realm_emoji.author_id = first_user_profile.id
+            realm_emoji.save(update_fields=["author_id"])
 
     if "zerver_huddle" in data:
         update_model_ids(Huddle, data, "huddle")
@@ -1051,6 +1144,9 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
             data, "zerver_realmauditlog", "acting_user", related_table="user_profile"
         )
         re_map_foreign_keys(data, "zerver_realmauditlog", "modified_stream", related_table="stream")
+        re_map_foreign_keys(
+            data, "zerver_realmauditlog", "modified_user_group", related_table="usergroup"
+        )
         update_model_ids(RealmAuditLog, data, related_table="realmauditlog")
         bulk_import_model(data, RealmAuditLog)
     else:
@@ -1080,7 +1176,7 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
     if "zerver_huddle" in data:
         process_huddle_hash(data, "zerver_huddle")
         bulk_import_model(data, Huddle)
-        for huddle in Huddle.objects.filter(recipient_id=None):
+        for huddle in Huddle.objects.filter(recipient=None):
             recipient = Recipient.objects.get(type=Recipient.HUDDLE, type_id=huddle.id)
             huddle.recipient = recipient
             huddle.save(update_fields=["recipient"])
@@ -1091,11 +1187,11 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
         update_model_ids(AlertWord, data, "alertword")
         bulk_import_model(data, AlertWord)
 
-    if "zerver_userhotspot" in data:
-        fix_datetime_fields(data, "zerver_userhotspot")
-        re_map_foreign_keys(data, "zerver_userhotspot", "user", related_table="user_profile")
-        update_model_ids(UserHotspot, data, "userhotspot")
-        bulk_import_model(data, UserHotspot)
+    if "zerver_onboardingstep" in data:
+        fix_datetime_fields(data, "zerver_onboardingstep")
+        re_map_foreign_keys(data, "zerver_onboardingstep", "user", related_table="user_profile")
+        update_model_ids(OnboardingStep, data, "onboardingstep")
+        bulk_import_model(data, OnboardingStep)
 
     if "zerver_usertopic" in data:
         fix_datetime_fields(data, "zerver_usertopic")
@@ -1119,16 +1215,6 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
         bulk_import_model(data, Service)
 
     if "zerver_usergroup" in data:
-        re_map_foreign_keys(data, "zerver_usergroup", "realm", related_table="realm")
-        re_map_foreign_keys_many_to_many(
-            data, "zerver_usergroup", "direct_members", related_table="user_profile"
-        )
-        re_map_foreign_keys_many_to_many(
-            data, "zerver_usergroup", "direct_subgroups", related_table="usergroup"
-        )
-        update_model_ids(UserGroup, data, "usergroup")
-        bulk_import_model(data, UserGroup)
-
         re_map_foreign_keys(
             data, "zerver_usergroupmembership", "user_group", related_table="usergroup"
         )
@@ -1146,6 +1232,12 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
         )
         update_model_ids(GroupGroupMembership, data, "groupgroupmembership")
         bulk_import_model(data, GroupGroupMembership)
+
+    # We expect Zulip server exports to contain UserGroupMembership objects
+    # for system groups, this logic here is needed to handle the imports from
+    # other services.
+    if role_system_groups_dict is not None:
+        add_users_to_system_user_groups(realm, user_profiles, role_system_groups_dict)
 
     if "zerver_botstoragedata" in data:
         re_map_foreign_keys(
@@ -1174,7 +1266,6 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
 
     fix_datetime_fields(data, "zerver_userpresence")
     re_map_foreign_keys(data, "zerver_userpresence", "user_profile", related_table="user_profile")
-    re_map_foreign_keys(data, "zerver_userpresence", "client", related_table="client")
     re_map_foreign_keys(data, "zerver_userpresence", "realm", related_table="realm")
     update_model_ids(UserPresence, data, "user_presence")
     bulk_import_model(data, UserPresence)
@@ -1207,18 +1298,39 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
     bulk_import_model(data, CustomProfileFieldValue)
 
     # Import uploaded files and avatars
-    import_uploads(realm, os.path.join(import_dir, "avatars"), processes, processing_avatars=True)
-    import_uploads(realm, os.path.join(import_dir, "uploads"), processes)
+    import_uploads(
+        realm,
+        os.path.join(import_dir, "avatars"),
+        processes,
+        default_user_profile_id=None,  # Fail if there is no user set
+        processing_avatars=True,
+    )
+    import_uploads(
+        realm,
+        os.path.join(import_dir, "uploads"),
+        processes,
+        default_user_profile_id=None,  # Fail if there is no user set
+    )
 
     # We need to have this check as the emoji files are only present in the data
     # importer from Slack
     # For Zulip export, this doesn't exist
     if os.path.exists(os.path.join(import_dir, "emoji")):
-        import_uploads(realm, os.path.join(import_dir, "emoji"), processes, processing_emojis=True)
+        import_uploads(
+            realm,
+            os.path.join(import_dir, "emoji"),
+            processes,
+            default_user_profile_id=first_user_profile.id if first_user_profile else None,
+            processing_emojis=True,
+        )
 
     if os.path.exists(os.path.join(import_dir, "realm_icons")):
         import_uploads(
-            realm, os.path.join(import_dir, "realm_icons"), processes, processing_realm_icons=True
+            realm,
+            os.path.join(import_dir, "realm_icons"),
+            processes,
+            default_user_profile_id=first_user_profile.id if first_user_profile else None,
+            processing_realm_icons=True,
         )
 
     sender_map = {user["id"]: user for user in data["zerver_userprofile"]}
@@ -1226,28 +1338,63 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
     # Import zerver_message and zerver_usermessage
     import_message_data(realm=realm, sender_map=sender_map, import_dir=import_dir)
 
+    if "zerver_scheduledmessage" in data:
+        fix_datetime_fields(data, "zerver_scheduledmessage")
+        re_map_foreign_keys(data, "zerver_scheduledmessage", "sender", related_table="user_profile")
+        re_map_foreign_keys(data, "zerver_scheduledmessage", "recipient", related_table="recipient")
+        re_map_foreign_keys(
+            data, "zerver_scheduledmessage", "sending_client", related_table="client"
+        )
+        re_map_foreign_keys(data, "zerver_scheduledmessage", "stream", related_table="stream")
+        re_map_foreign_keys(data, "zerver_scheduledmessage", "realm", related_table="realm")
+        re_map_foreign_keys(
+            data, "zerver_scheduledmessage", "delivered_message", related_table="message"
+        )
+
+        fix_upload_links(data, "zerver_scheduledmessage")
+
+        fix_message_rendered_content(
+            realm=realm,
+            sender_map=sender_map,
+            messages=data["zerver_scheduledmessage"],
+        )
+
+        update_model_ids(ScheduledMessage, data, "scheduledmessage")
+        bulk_import_model(data, ScheduledMessage)
+
     re_map_foreign_keys(data, "zerver_reaction", "message", related_table="message")
     re_map_foreign_keys(data, "zerver_reaction", "user_profile", related_table="user_profile")
-    re_map_foreign_keys(
-        data,
-        "zerver_reaction",
-        "emoji_code",
-        related_table="realmemoji",
-        id_field=True,
-        reaction_field=True,
-    )
+    re_map_realm_emoji_codes(data, table_name="zerver_reaction")
     update_model_ids(Reaction, data, "reaction")
     bulk_import_model(data, Reaction)
 
     # Similarly, we need to recalculate the first_message_id for stream objects.
-    for stream in Stream.objects.filter(realm=realm):
-        recipient = Recipient.objects.get(type=Recipient.STREAM, type_id=stream.id)
-        first_message = Message.objects.filter(recipient=recipient).first()
-        if first_message is None:
-            stream.first_message_id = None
-        else:
-            stream.first_message_id = first_message.id
-        stream.save(update_fields=["first_message_id"])
+    update_first_message_id_query = SQL(
+        """
+    UPDATE zerver_stream
+    SET first_message_id = subquery.first_message_id
+    FROM (
+        SELECT r.type_id id, min(m.id) first_message_id
+        FROM zerver_message m
+        JOIN zerver_recipient r ON
+        r.id = m.recipient_id
+        WHERE r.type = 2 AND m.realm_id = %(realm_id)s
+        GROUP BY r.type_id
+        ) AS subquery
+    WHERE zerver_stream.id = subquery.id
+    """
+    )
+
+    with connection.cursor() as cursor:
+        cursor.execute(update_first_message_id_query, {"realm_id": realm.id})
+
+    if "zerver_userstatus" in data:
+        fix_datetime_fields(data, "zerver_userstatus")
+        re_map_foreign_keys(data, "zerver_userstatus", "user_profile", related_table="user_profile")
+        re_map_foreign_keys(data, "zerver_userstatus", "client", related_table="client")
+        update_model_ids(UserStatus, data, "userstatus")
+        re_map_realm_emoji_codes(data, table_name="zerver_userstatus")
+        bulk_import_model(data, UserStatus)
 
     # Do attachments AFTER message data is loaded.
     # TODO: de-dup how we read these json files.
@@ -1257,40 +1404,39 @@ def do_import_realm(import_dir: Path, subdomain: str, processes: int = 1) -> Rea
 
     logging.info("Importing attachment data from %s", fn)
     with open(fn, "rb") as f:
-        data = orjson.loads(f.read())
+        attachment_data = orjson.loads(f.read())
 
-    import_attachments(data)
+    import_attachments(attachment_data)
 
     # Import the analytics file.
     import_analytics_data(realm=realm, import_dir=import_dir)
 
     if settings.BILLING_ENABLED:
-        do_change_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
     else:
-        do_change_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=None)
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=None)
+
+    # Activate the realm
+    realm.deactivated = data["zerver_realm"][0]["deactivated"]
+    realm.save()
+
+    # This helps to have an accurate user count data for the billing
+    # system if someone tries to signup just after doing import.
+    RealmAuditLog.objects.create(
+        realm=realm,
+        event_type=RealmAuditLog.REALM_IMPORTED,
+        event_time=timezone_now(),
+        extra_data={
+            RealmAuditLog.ROLE_COUNT: realm_user_count_by_role(realm),
+        },
+    )
+
+    # Ask the push notifications service if this realm can send
+    # notifications, if we're using it. Needs to happen after the
+    # Realm object is reactivated.
+    maybe_enqueue_audit_log_upload(realm)
+
     return realm
-
-
-# create_users and do_import_system_bots differ from their equivalent
-# in zerver/lib/server_initialization.py because here we check if the
-# bots don't already exist and only then create a user for these bots.
-def do_import_system_bots(realm: Any) -> None:
-    internal_bots = [
-        (bot["name"], bot["email_template"] % (settings.INTERNAL_BOT_DOMAIN,))
-        for bot in settings.INTERNAL_BOTS
-    ]
-    create_users(realm, internal_bots, bot_type=UserProfile.DEFAULT_BOT)
-    print("Finished importing system bots.")
-
-
-def create_users(
-    realm: Realm, name_list: Iterable[Tuple[str, str]], bot_type: Optional[int] = None
-) -> None:
-    user_set = set()
-    for full_name, email in name_list:
-        if not UserProfile.objects.filter(email=email):
-            user_set.add((email, full_name, True))
-    bulk_create_users(realm, user_set, bot_type)
 
 
 def update_message_foreign_keys(import_dir: Path, sort_by_date: bool) -> None:
@@ -1348,7 +1494,7 @@ def get_incoming_message_ids(import_dir: Path, sort_by_date: bool) -> List[int]:
             # save memory and speed up the sort.  For
             # Zulip-to-Zulip imports, the
             # message_id will generally be a good tiebreaker.
-            # If we occasionally mis-order the ids for two
+            # If we occasionally misorder the ids for two
             # messages from the same second, it's not the
             # end of the world, as it's likely those messages
             # arrived to the original server in somewhat
@@ -1395,6 +1541,8 @@ def import_message_data(realm: Realm, sender_map: Dict[int, Record], import_dir:
         # apply them.
         message_id_map = ID_MAP["message"]
         for row in data["zerver_message"]:
+            del row["realm"]
+            row["realm_id"] = realm.id
             row["id"] = message_id_map[row["id"]]
 
         for row in data["zerver_usermessage"]:
@@ -1425,7 +1573,6 @@ def import_message_data(realm: Realm, sender_map: Dict[int, Record], import_dir:
 
 
 def import_attachments(data: TableData) -> None:
-
     # Clean up the data in zerver_attachment that is not
     # relevant to our many-to-many import.
     fix_datetime_fields(data, "zerver_attachment")
@@ -1440,11 +1587,7 @@ def import_attachments(data: TableData) -> None:
     parent_model = Attachment
     parent_db_table_name = "zerver_attachment"
     parent_singular = "attachment"
-    child_singular = "message"
-    child_plural = "messages"
-    m2m_table_name = "zerver_attachment_messages"
     parent_id = "attachment_id"
-    child_id = "message_id"
 
     update_model_ids(parent_model, data, "attachment")
     # We don't bulk_import_model yet, because we need to first compute
@@ -1454,23 +1597,42 @@ def import_attachments(data: TableData) -> None:
     # We do this in a slightly convoluted way to anticipate
     # a future where we may need to call re_map_foreign_keys.
 
-    m2m_rows: List[Record] = []
-    for parent_row in data[parent_db_table_name]:
-        for fk_id in parent_row[child_plural]:
-            m2m_row: Record = {}
-            m2m_row[parent_singular] = parent_row["id"]
-            m2m_row[child_singular] = ID_MAP["message"][fk_id]
-            m2m_rows.append(m2m_row)
+    def format_m2m_data(
+        child_singular: str, child_plural: str, m2m_table_name: str, child_id: str
+    ) -> Tuple[str, List[Record], str]:
+        m2m_rows = [
+            {
+                parent_singular: parent_row["id"],
+                # child_singular will generally match the model name (e.g. Message, ScheduledMessage)
+                # after lowercasing, and that's what we enter as ID_MAP keys, so this should be
+                # a reasonable assumption to make.
+                child_singular: ID_MAP[child_singular][fk_id],
+            }
+            for parent_row in data[parent_db_table_name]
+            for fk_id in parent_row[child_plural]
+        ]
 
-    # Create our table data for insert.
-    m2m_data: TableData = {m2m_table_name: m2m_rows}
-    convert_to_id_fields(m2m_data, m2m_table_name, parent_singular)
-    convert_to_id_fields(m2m_data, m2m_table_name, child_singular)
-    m2m_rows = m2m_data[m2m_table_name]
+        # Create our table data for insert.
+        m2m_data: TableData = {m2m_table_name: m2m_rows}
+        convert_to_id_fields(m2m_data, m2m_table_name, parent_singular)
+        convert_to_id_fields(m2m_data, m2m_table_name, child_singular)
+        m2m_rows = m2m_data[m2m_table_name]
 
-    # Next, delete out our child data from the parent rows.
-    for parent_row in data[parent_db_table_name]:
-        del parent_row[child_plural]
+        # Next, delete out our child data from the parent rows.
+        for parent_row in data[parent_db_table_name]:
+            del parent_row[child_plural]
+
+        return m2m_table_name, m2m_rows, child_id
+
+    messages_m2m_tuple = format_m2m_data(
+        "message", "messages", "zerver_attachment_messages", "message_id"
+    )
+    scheduled_messages_m2m_tuple = format_m2m_data(
+        "scheduledmessage",
+        "scheduled_messages",
+        "zerver_attachment_scheduled_messages",
+        "scheduledmessage_id",
+    )
 
     # Update 'path_id' for the attachments
     for attachment in data[parent_db_table_name]:
@@ -1483,19 +1645,23 @@ def import_attachments(data: TableData) -> None:
     # TODO: Do this the kosher Django way.  We may find a
     # better way to do this in Django 1.9 particularly.
     with connection.cursor() as cursor:
-        sql_template = SQL(
+        for m2m_table_name, m2m_rows, child_id in [
+            messages_m2m_tuple,
+            scheduled_messages_m2m_tuple,
+        ]:
+            sql_template = SQL(
+                """
+                INSERT INTO {m2m_table_name} ({parent_id}, {child_id}) VALUES %s
             """
-            INSERT INTO {m2m_table_name} ({parent_id}, {child_id}) VALUES %s
-        """
-        ).format(
-            m2m_table_name=Identifier(m2m_table_name),
-            parent_id=Identifier(parent_id),
-            child_id=Identifier(child_id),
-        )
-        tups = [(row[parent_id], row[child_id]) for row in m2m_rows]
-        execute_values(cursor.cursor, sql_template, tups)
+            ).format(
+                m2m_table_name=Identifier(m2m_table_name),
+                parent_id=Identifier(parent_id),
+                child_id=Identifier(child_id),
+            )
+            tups = [(row[parent_id], row[child_id]) for row in m2m_rows]
+            execute_values(cursor.cursor, sql_template, tups)
 
-    logging.info("Successfully imported M2M table %s", m2m_table_name)
+            logging.info("Successfully imported M2M table %s", m2m_table_name)
 
 
 def import_analytics_data(realm: Realm, import_dir: Path) -> None:
@@ -1524,3 +1690,37 @@ def import_analytics_data(realm: Realm, import_dir: Path) -> None:
     re_map_foreign_keys(data, "analytics_streamcount", "stream", related_table="stream")
     update_model_ids(StreamCount, data, "analytics_streamcount")
     bulk_import_model(data, StreamCount)
+
+
+def add_users_to_system_user_groups(
+    realm: Realm, user_profiles: List[UserProfile], role_system_groups_dict: Dict[int, UserGroup]
+) -> None:
+    full_members_system_group = UserGroup.objects.get(
+        name=SystemGroups.FULL_MEMBERS,
+        realm=realm,
+        is_system_group=True,
+    )
+
+    usergroup_memberships = []
+    for user_profile in user_profiles:
+        user_group = role_system_groups_dict[user_profile.role]
+        usergroup_memberships.append(
+            UserGroupMembership(user_profile=user_profile, user_group=user_group)
+        )
+        if user_profile.role == UserProfile.ROLE_MEMBER and not user_profile.is_provisional_member:
+            usergroup_memberships.append(
+                UserGroupMembership(user_profile=user_profile, user_group=full_members_system_group)
+            )
+    UserGroupMembership.objects.bulk_create(usergroup_memberships)
+    now = timezone_now()
+    RealmAuditLog.objects.bulk_create(
+        RealmAuditLog(
+            realm=realm,
+            modified_user=membership.user_profile,
+            modified_user_group=membership.user_group,
+            event_type=RealmAuditLog.USER_GROUP_DIRECT_USER_MEMBERSHIP_ADDED,
+            event_time=now,
+            acting_user=None,
+        )
+        for membership in usergroup_memberships
+    )

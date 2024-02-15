@@ -1,16 +1,31 @@
-# Production installation
+# Install a Zulip server
 
-You'll need an Ubuntu or Debian system that satisfies
-[the installation requirements](../production/requirements.md). Alternatively,
+## Before you begin
+
+To install a Zulip server, you'll need an Ubuntu or Debian system that satisfies
+[the installation requirements](requirements.md). Alternatively,
 you can use a preconfigured
 [DigitalOcean droplet](https://marketplace.digitalocean.com/apps/zulip?refcode=3ee45da8ee26), or
 Zulip's
-[experimental Docker image](../production/deployment.html#zulip-in-docker).
+[experimental Docker image](deployment.md#zulip-in-docker).
 
-Note that if you're developing for Zulip, you should install Zulip's
-[development environment](../development/overview.md) instead. If
-you're just looking to play around with Zulip and see what it looks like,
-you can create a test organization at <https://zulip.com/new>.
+### Should I follow this installation guide?
+
+- If you would like to try out Zulip, you can start by [checking it out in the
+  Zulip development community](https://zulip.com/try-zulip/), or [create a test
+  Zulip Cloud organization](https://zulip.com/new/).
+
+- If you are deciding between self-hosting Zulip and signing up for [Zulip
+  Cloud](https://zulip.com/plans/), our [self-hosting
+  overview](https://zulip.com/self-hosting/) and [guide to choosing between
+  Zulip Cloud and
+  self-hosting](https://zulip.com/help/getting-your-organization-started-with-zulip#choosing-between-zulip-cloud-and-self-hosting)
+  are great places to start.
+
+- If you're developing for Zulip, you should follow the instructions
+  to install Zulip's [development environment](../development/overview.md).
+
+If you'd like to install a self-hosted Zulip server, this guide is for you!
 
 ## Step 1: Download the latest release
 
@@ -27,7 +42,7 @@ tar -xf zulip-server-latest.tar.gz
 - If you'd like to verify the download, we
   [publish the sha256sums of our release tarballs](https://download.zulip.com/server/SHA256SUMS.txt).
 - You can also
-  [install a pre-release version of Zulip](../production/deployment.html#installing-zulip-from-git)
+  [install a pre-release version of Zulip](deployment.md#installing-zulip-from-git)
   using code from our [repository on GitHub](https://github.com/zulip/zulip/).
 
 ## Step 2: Install Zulip
@@ -42,16 +57,20 @@ sudo -s  # If not already root
 ```
 
 This takes a few minutes to run, as it installs Zulip's dependencies.
-For more on what the installer does, [see details below](#installer-details).
+For more on what the installer does, [see details below](#details-what-the-installer-does).
 
 If the script gives an error, consult [Troubleshooting](#troubleshooting) below.
 
 #### Installer options
 
-- `--email=you@example.com`: The email address of the person or team
-  who should get support and error emails from this Zulip server.
-  This becomes `ZULIP_ADMINISTRATOR` ([docs][doc-settings]) in the
-  Zulip settings.
+- `--email=you@example.com`: The email address for the person or team who
+  maintains the Zulip installation. Note that this is a public-facing email
+  address; it may appear on 404 pages, is used as the sender's address for many
+  automated emails, and is advertised as a support address. An email address
+  like support@example.com is totally reasonable, as is admin@example.com. Do
+  not put a display name; e.g. "support@example.com", not "Zulip Support
+  <support@example.com>". This becomes `ZULIP_ADMINISTRATOR`
+  ([docs][doc-settings]) in the Zulip settings.
 
 - `--hostname=zulip.example.com`: The user-accessible domain name for
   this Zulip server, i.e., what users will type in their web browser.
@@ -63,17 +82,19 @@ If the script gives an error, consult [Troubleshooting](#troubleshooting) below.
   suitable for production use, but may be convenient for testing.
 
 - `--certbot`: With this option, the Zulip installer automatically
-  obtains an SSL certificate for the server [using Certbot][doc-certbot].
-  If you'd prefer to acquire an SSL certificate yourself in any other
-  way, it's easy to [provide it to Zulip][doc-ssl-manual].
+  obtains an SSL certificate for the server [using
+  Certbot][doc-certbot], and configures a cron job to renew the
+  certificate automatically. If you'd prefer to acquire an SSL
+  certificate yourself in any other way, it's easy to [provide it to
+  Zulip][doc-ssl-manual].
 
 You can see the more advanced installer options in our [deployment options][doc-deployment-options]
 documentation.
 
-[doc-settings]: ../production/settings.md
-[doc-certbot]: ../production/ssl-certificates.html#certbot-recommended
-[doc-ssl-manual]: ../production/ssl-certificates.html#manual-install
-[doc-deployment-options]: ../production/deployment.html#advanced-installer-options
+[doc-settings]: settings.md
+[doc-certbot]: ssl-certificates.md#certbot-recommended
+[doc-ssl-manual]: ssl-certificates.md#manual-install
+[doc-deployment-options]: deployment.md#advanced-installer-options
 
 ## Step 3: Create a Zulip organization, and log in
 
@@ -83,7 +104,7 @@ or another Zulip server, you should stop here
 and return to the import instructions.
 
 [slack-import]: https://zulip.com/help/import-from-slack
-[zulip-backups]: ../production/export-and-import.html#backups
+[zulip-backups]: export-and-import.md#backups
 
 Otherwise, open the link in a browser. Follow the prompts to set up
 your organization, and your own user account as an administrator.
@@ -115,13 +136,11 @@ Learning more:
   releases](../overview/release-lifecycle.md) and security issues.
 - Follow [Zulip on Twitter](https://twitter.com/zulip).
 - Learn how to [configure your Zulip server settings](settings.md).
-- Learn about [Backups, export and import](../production/export-and-import.md)
-  and [upgrading](../production/upgrade-or-modify.md) a production Zulip
+- Learn about [Backups, export and import](export-and-import.md)
+  and [upgrading](upgrade.md) a production Zulip
   server.
 
 [realm-admin-docs]: https://zulip.com/help/getting-your-organization-started-with-zulip
-
-(installer-details)=
 
 ## Details: What the installer does
 
@@ -169,13 +188,7 @@ the bottom of `/var/log/zulip/errors.log` for a traceback, and consult
 the [troubleshooting section](troubleshooting.md) for advice on
 how to debug.
 
-**Community.** If the tips above don't help, please visit [#production
-help][production-help] in the [Zulip development community
-server][chat-zulip-org] for realtime help, and we'll try to help you
-out! Please provide details like the full traceback from the bottom
-of `/var/log/zulip/errors.log` in your report (ideally in a [code
-block][code-block]).
-
-[chat-zulip-org]: https://zulip.com/developer-community/
-[production-help]: https://chat.zulip.org/#narrow/stream/31-production-help
-[code-block]: https://zulip.com/help/code-blocks
+**Still having trouble?**
+Please see the [troubleshooting and monitoring
+guide](../production/troubleshooting.md) for additional advice and ways to get
+help.

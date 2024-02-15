@@ -5,8 +5,9 @@ from typing import Any
 
 from django.conf import settings
 from django.core.management.base import CommandError
+from typing_extensions import override
 
-from zerver.lib.actions import do_deactivate_realm
+from zerver.actions.realm_settings import do_deactivate_realm
 from zerver.lib.export import export_realm_wrapper
 from zerver.lib.management import ZulipBaseCommand
 from zerver.models import Message, Reaction, UserProfile
@@ -31,7 +32,7 @@ class Command(ZulipBaseCommand):
     * Mobile tokens for APNS/GCM (users will need to reconnect their mobile devices)
     * ScheduledEmail (not relevant on a new server)
     * RemoteZulipServer (unlikely to be migrated)
-    * third_party_api_results cache (this means rerending all old
+    * third_party_api_results cache (this means rerendering all old
       messages could be expensive)
 
     Things that will break as a result of the export:
@@ -60,9 +61,6 @@ class Command(ZulipBaseCommand):
 
     * Use `./manage.py import` to import the realm
 
-    * Use `./manage.py reactivate_realm` to reactivate the realm, so
-      users can log in again.
-
     * Inform the users about the things broken above.
 
     We recommend testing by exporting without `--deactivate` first, to
@@ -75,6 +73,7 @@ class Command(ZulipBaseCommand):
     minutes.  But this will vary a lot depending on the average number
     of recipients of messages in the realm, hardware, etc."""
 
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "--output", dest="output_dir", help="Directory to write exported data to."
@@ -92,7 +91,10 @@ class Command(ZulipBaseCommand):
         parser.add_argument(
             "--deactivate-realm",
             action="store_true",
-            help="Deactivate the realm immediately before exporting",
+            help=(
+                "Deactivate the realm immediately before exporting; the exported data "
+                "will show the realm as active"
+            ),
         )
         parser.add_argument(
             "--consent-message-id",
@@ -104,13 +106,9 @@ class Command(ZulipBaseCommand):
             action="store_true",
             help="Whether to upload resulting tarball to s3 or LOCAL_UPLOADS_DIR",
         )
-        parser.add_argument(
-            "--delete-after-upload",
-            action="store_true",
-            help="Automatically delete the local tarball after a successful export",
-        )
         self.add_realm_args(parser, required=True)
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         realm = self.get_realm(options)
         assert realm is not None  # Should be ensured by parser
@@ -215,7 +213,7 @@ class Command(ZulipBaseCommand):
             threads=num_threads,
             upload=options["upload"],
             public_only=public_only,
-            delete_after_upload=options["delete_after_upload"],
             percent_callback=percent_callback,
             consent_message_id=consent_message_id,
+            export_as_active=True if options["deactivate_realm"] else None,
         )

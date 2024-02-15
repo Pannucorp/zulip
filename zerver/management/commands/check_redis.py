@@ -4,9 +4,11 @@ from typing import Any, Callable, Optional
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError, CommandParser
+from returns.curry import partial
+from typing_extensions import override
 
 from zerver.lib.rate_limiter import RateLimitedUser, client
-from zerver.models import get_user_profile_by_id
+from zerver.models.users import get_user_profile_by_id
 
 
 class Command(BaseCommand):
@@ -15,6 +17,7 @@ class Command(BaseCommand):
 
     Usage: ./manage.py [--trim] check_redis"""
 
+    @override
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument("-t", "--trim", action="store_true", help="Actually trim excess")
 
@@ -45,6 +48,7 @@ than max_api_calls! (trying to trim) %s %s",
                 client.expire(key, entity.max_api_window())
                 trim_func(key, max_calls)
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         if not settings.RATE_LIMITING:
             raise CommandError("This machine is not using Redis or rate limiting, aborting")
@@ -61,7 +65,7 @@ than max_api_calls! (trying to trim) %s %s",
 
         lists = client.keys(wildcard_list)
         for list_name in lists:
-            self._check_within_range(list_name, lambda: client.llen(list_name), trim_func)
+            self._check_within_range(list_name, partial(client.llen, list_name), trim_func)
 
         zsets = client.keys(wildcard_zset)
         for zset in zsets:
@@ -70,5 +74,7 @@ than max_api_calls! (trying to trim) %s %s",
             # elements to trim. We'd have to go through every list item and take
             # the intersection. The best we can do is expire it
             self._check_within_range(
-                zset, lambda: client.zcount(zset, 0, now), lambda key, max_calls: None
+                zset,
+                partial(client.zcount, zset, 0, now),
+                lambda key, max_calls: None,
             )

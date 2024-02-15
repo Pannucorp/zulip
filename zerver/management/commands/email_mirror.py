@@ -9,7 +9,7 @@ EMAIL_GATEWAY_PATTERN delivers emails directly to Zulip, and this, a
 cron job that connects to an IMAP inbox (which receives the emails)
 periodically.
 
-Run this in a cronjob every N minutes if you have configured Zulip to
+Run this in a cron job every N minutes if you have configured Zulip to
 poll an external IMAP mailbox for messages. The script will then
 connect to your IMAP server and batch-process all messages.
 
@@ -17,6 +17,7 @@ We extract and validate the target stream from information in the
 recipient address and retrieve, forward, and archive the message.
 
 """
+
 import email
 import email.policy
 import logging
@@ -26,6 +27,7 @@ from typing import Any, Generator
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from typing_extensions import override
 
 from zerver.lib.email_mirror import logger, process_message
 
@@ -80,6 +82,7 @@ def get_imap_messages() -> Generator[EmailMessage, None, None]:
 class Command(BaseCommand):
     help = __doc__
 
+    @override
     def handle(self, *args: Any, **options: str) -> None:
         for message in get_imap_messages():
             process_message(message)

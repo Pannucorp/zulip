@@ -12,11 +12,10 @@ normal_queues = [
     "deferred_work",
     "digest_emails",
     "email_mirror",
+    "email_senders",
     "embed_links",
     "embedded_bots",
-    "error_reports",
     "invites",
-    "email_senders",
     "missedmessage_emails",
     "missedmessage_mobile_notifications",
     "outgoing_webhooks",
@@ -39,12 +38,14 @@ states = {
 
 MAX_SECONDS_TO_CLEAR: DefaultDict[str, int] = defaultdict(
     lambda: 30,
+    deferred_work=600,
     digest_emails=1200,
     missedmessage_mobile_notifications=120,
     embed_links=60,
 )
 CRITICAL_SECONDS_TO_CLEAR: DefaultDict[str, int] = defaultdict(
     lambda: 60,
+    deferred_work=900,
     missedmessage_mobile_notifications=180,
     digest_emails=1800,
     embed_links=90,
@@ -129,12 +130,12 @@ def check_other_queues(queue_counts_dict: Dict[str, int]) -> List[Dict[str, Any]
 
 def check_rabbitmq_queues() -> None:
     pattern = re.compile(r"(\w+)\t(\d+)\t(\d+)")
-    if "USER" in os.environ and not os.environ["USER"] in ["root", "rabbitmq"]:
+    if "USER" in os.environ and os.environ["USER"] not in ["root", "rabbitmq"]:
         print("This script must be run as the root or rabbitmq user")
 
     list_queues_output = subprocess.check_output(
         ["/usr/sbin/rabbitmqctl", "list_queues", "name", "messages", "consumers"],
-        universal_newlines=True,
+        text=True,
     )
     queue_counts_rabbitmqctl = {}
     queues_with_consumers = []
@@ -151,7 +152,7 @@ def check_rabbitmq_queues() -> None:
 
     queue_stats_dir = subprocess.check_output(
         [os.path.join(ZULIP_PATH, "scripts/get-django-setting"), "QUEUE_STATS_DIR"],
-        universal_newlines=True,
+        text=True,
     ).strip()
     queue_stats: Dict[str, Dict[str, Any]] = {}
     queues_to_check = set(normal_queues).intersection(set(queues_with_consumers))

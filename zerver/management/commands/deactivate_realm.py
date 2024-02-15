@@ -1,19 +1,23 @@
 from argparse import ArgumentParser
 from typing import Any
 
-from zerver.lib.actions import do_add_deactivated_redirect, do_deactivate_realm
+from typing_extensions import override
+
+from zerver.actions.realm_settings import do_add_deactivated_redirect, do_deactivate_realm
 from zerver.lib.management import ZulipBaseCommand
 
 
 class Command(ZulipBaseCommand):
     help = """Script to deactivate a realm."""
 
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "--redirect_url", metavar="<redirect_url>", help="URL to which the realm has moved"
         )
         self.add_realm_args(parser, required=True)
 
+    @override
     def handle(self, *args: Any, **options: str) -> None:
         realm = self.get_realm(options)
 
@@ -25,7 +29,7 @@ class Command(ZulipBaseCommand):
 
         if realm.deactivated:
             print("The realm", options["realm_id"], "is already deactivated.")
-            exit(0)
+            return
 
         print("Deactivating", options["realm_id"])
         do_deactivate_realm(realm, acting_user=None)

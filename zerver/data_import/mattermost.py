@@ -2,6 +2,7 @@
 spec:
 https://docs.mattermost.com/administration/bulk-export.html
 """
+
 import logging
 import os
 import random
@@ -39,7 +40,7 @@ from zerver.data_import.sequencer import NEXT_ID, IdMapper
 from zerver.data_import.user_handler import UserHandler
 from zerver.lib.emoji import name_to_codepoint
 from zerver.lib.markdown import IMAGE_EXTENSIONS
-from zerver.lib.upload import sanitize_name
+from zerver.lib.upload.base import sanitize_name
 from zerver.lib.utils import process_list_in_batches
 from zerver.models import Reaction, RealmEmoji, Recipient, UserProfile
 
@@ -65,8 +66,16 @@ def process_user(
     def is_team_admin(user_dict: Dict[str, Any]) -> bool:
         if user_dict["teams"] is None:
             return False
+        return any(
+            team["name"] == team_name and "team_admin" in team["roles"]
+            for team in user_dict["teams"]
+        )
+
+    def is_team_guest(user_dict: Dict[str, Any]) -> bool:
+        if user_dict["teams"] is None:
+            return False
         for team in user_dict["teams"]:
-            if team["name"] == team_name and "team_admin" in team["roles"]:
+            if team["name"] == team_name and "team_guest" in team["roles"]:
                 return True
         return False
 
@@ -85,9 +94,12 @@ def process_user(
     date_joined = int(timezone_now().timestamp())
     timezone = "UTC"
 
-    role = UserProfile.ROLE_MEMBER
     if is_team_admin(user_dict):
         role = UserProfile.ROLE_REALM_OWNER
+    elif is_team_guest(user_dict):
+        role = UserProfile.ROLE_GUEST
+    else:
+        role = UserProfile.ROLE_MEMBER
 
     if user_dict["is_mirror_dummy"]:
         is_active = False
@@ -119,7 +131,6 @@ def convert_user_data(
     realm_id: int,
     team_name: str,
 ) -> None:
-
     user_data_list = []
     for username in user_data_map:
         user = user_data_map[username]
@@ -239,7 +250,6 @@ def convert_huddle_data(
     realm_id: int,
     team_name: str,
 ) -> List[ZerverFieldsT]:
-
     zerver_huddle = []
     for huddle in huddle_data:
         if len(huddle["members"]) > 2:
@@ -270,7 +280,7 @@ def build_reactions(
         realmemoji[realm_emoji["name"]] = realm_emoji["id"]
 
     # For the Unicode emoji codes, we use equivalent of
-    # function 'emoji_name_to_emoji_code' in 'zerver/lib/emoji' here
+    # function 'get_emoji_data' in 'zerver/lib/emoji' here
     for mattermost_reaction in reactions:
         emoji_name = mattermost_reaction["emoji_name"]
         username = mattermost_reaction["user"]
@@ -422,10 +432,6 @@ def process_raw_message_batch(
     mention_map: Dict[int, Set[int]] = {}
     zerver_message = []
 
-    import html2text
-
-    h = html2text.HTML2Text()
-
     pm_members = {}
 
     for raw_message in raw_messages:
@@ -437,7 +443,9 @@ def process_raw_message_batch(
             content=raw_message["content"],
             mention_user_ids=mention_user_ids,
         )
-        content = h.handle(content)
+
+        # html2text is GPL licensed, so run it as a subprocess.
+        content = subprocess.check_output(["html2text"], input=content, text=True)
 
         if len(content) > 10000:  # nocoverage
             logging.info("skipping too-long message of length %s", len(content))
@@ -494,6 +502,7 @@ def process_raw_message_batch(
             message_id=message_id,
             date_sent=date_sent,
             recipient_id=recipient_id,
+            realm_id=realm_id,
             rendered_content=rendered_content,
             topic_name=topic_name,
             user_id=sender_user_id,
@@ -546,11 +555,10 @@ def process_posts(
     zerver_attachment: List[ZerverFieldsT],
     mattermost_data_dir: str,
 ) -> None:
-
     post_data_list = []
     for post in post_data:
         if "team" not in post:
-            # Mattermost doesn't specify a team for private messages
+            # Mattermost doesn't specify a team for direct messages
             # in its export format.  This line of code requires that
             # we only be importing data from a single team (checked
             # elsewhere) -- we just assume it's the target team.
@@ -583,9 +591,9 @@ def process_posts(
         if "channel" in post_dict:
             message_dict["channel_name"] = post_dict["channel"]
         elif "channel_members" in post_dict:
-            # This case is for handling posts from PMs and huddles, not channels.
-            # PMs and huddles are known as direct_channels in Slack and hence
-            # the name channel_members.
+            # This case is for handling posts from direct messages and huddles,
+            # not channels. Direct messages and huddles are known as direct_channels
+            # in Slack and hence the name channel_members.
             channel_members = post_dict["channel_members"]
             if len(channel_members) > 2:
                 message_dict["huddle_name"] = generate_huddle_name(channel_members)
@@ -689,7 +697,7 @@ def write_message_data(
     else:
         post_types = ["channel_post"]
         logging.warning(
-            "Skipping importing huddles and PMs since there are multiple teams in the export"
+            "Skipping importing huddles and DMs since there are multiple teams in the export"
         )
 
     for post_type in post_types:
@@ -810,10 +818,7 @@ def check_user_in_team(user: Dict[str, Any], team_name: str) -> bool:
     if user["teams"] is None:
         # This is null for users not on any team
         return False
-    for team in user["teams"]:
-        if team["name"] == team_name:
-            return True
-    return False
+    return any(team["name"] == team_name for team in user["teams"])
 
 
 def label_mirror_dummy_users(
@@ -1009,7 +1014,3 @@ def do_convert_data(mattermost_data_dir: str, output_dir: str, masking_content: 
         attachment: Dict[str, List[Any]] = {"zerver_attachment": zerver_attachment}
         create_converted_data_files(uploads_list, realm_output_dir, "/uploads/records.json")
         create_converted_data_files(attachment, realm_output_dir, "/attachment.json")
-
-        logging.info("Start making tarball")
-        subprocess.check_call(["tar", "-czf", realm_output_dir + ".tar.gz", realm_output_dir, "-P"])
-        logging.info("Done making tarball")

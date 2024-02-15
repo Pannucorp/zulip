@@ -1,6 +1,6 @@
 Get Zulip notifications for your Capistrano deploys!
 
-1.  {!create-a-bot-indented.md!}
+1.  {!create-an-incoming-webhook.md!}
 
 1.  {!download-python-bindings.md!}
 
@@ -22,7 +22,7 @@ Get Zulip notifications for your Capistrano deploys!
 
     The `--user` and `--api-key` should be the email and API key of the Zulip
     bot created above. You can also put these values in a `~/.zuliprc` file on
-    your Capistrano machine. See our [API docs](/api) for instructions on
+    your Capistrano machine. See our [API docs](/api/) for instructions on
     creating that file.
 
 !!! tip ""

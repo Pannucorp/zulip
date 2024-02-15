@@ -3,11 +3,14 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 from unittest import mock
 
 import orjson
+import time_machine
 from django.apps import apps
 from django.db import models
 from django.db.models import Sum
+from django.test import override_settings
 from django.utils.timezone import now as timezone_now
 from psycopg2.sql import SQL, Literal
+from typing_extensions import override
 
 from analytics.lib.counts import (
     COUNT_STATS,
@@ -32,24 +35,33 @@ from analytics.models import (
     UserCount,
     installation_epoch,
 )
-from zerver.lib.actions import (
+from zerver.actions.create_realm import do_create_realm
+from zerver.actions.create_user import (
     do_activate_mirror_dummy_user,
-    do_create_realm,
     do_create_user,
-    do_deactivate_user,
-    do_invite_users,
-    do_mark_all_as_read,
-    do_mark_stream_messages_as_read,
     do_reactivate_user,
+)
+from zerver.actions.invites import (
+    do_invite_users,
     do_resend_user_invite_email,
     do_revoke_user_invite,
-    do_update_message_flags,
-    update_user_activity_interval,
 )
+from zerver.actions.message_flags import (
+    do_mark_all_as_read,
+    do_mark_stream_messages_as_read,
+    do_update_message_flags,
+)
+from zerver.actions.user_activity import update_user_activity_interval
+from zerver.actions.users import do_deactivate_user
 from zerver.lib.create_user import create_user
 from zerver.lib.exceptions import InvitationError
+from zerver.lib.push_notifications import (
+    get_message_payload_apns,
+    get_message_payload_gcm,
+    hex_to_b64,
+)
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.timestamp import TimezoneNotUTCException, floor_to_day
+from zerver.lib.timestamp import TimeZoneNotUTCError, ceiling_to_day, floor_to_day
 from zerver.lib.topic import DB_TOPIC_NAME
 from zerver.lib.utils import assert_is_not_none
 from zerver.models import (
@@ -62,10 +74,21 @@ from zerver.models import (
     Recipient,
     Stream,
     UserActivityInterval,
+    UserGroup,
     UserProfile,
-    get_client,
-    get_user,
 )
+from zerver.models.clients import get_client
+from zerver.models.groups import SystemGroups
+from zerver.models.scheduled_jobs import NotificationTriggers
+from zerver.models.users import get_user, is_cross_realm_bot_email
+from zilencer.models import (
+    RemoteInstallationCount,
+    RemotePushDeviceToken,
+    RemoteRealm,
+    RemoteRealmCount,
+    RemoteZulipServer,
+)
+from zilencer.views import get_last_id_from_server
 
 
 class AnalyticsTestCase(ZulipTestCase):
@@ -75,16 +98,26 @@ class AnalyticsTestCase(ZulipTestCase):
     TIME_ZERO = datetime(1988, 3, 14, tzinfo=timezone.utc)
     TIME_LAST_HOUR = TIME_ZERO - HOUR
 
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.default_realm = do_create_realm(
             string_id="realmtest", name="Realm Test", date_created=self.TIME_ZERO - 2 * self.DAY
         )
+        self.administrators_user_group = UserGroup.objects.get(
+            name=SystemGroups.ADMINISTRATORS,
+            realm=self.default_realm,
+            is_system_group=True,
+        )
 
         # used to generate unique names in self.create_*
         self.name_counter = 100
-        # used as defaults in self.assertCountEquals
+        # used as defaults in self.assert_table_count
         self.current_property: Optional[str] = None
+
+        # Delete RemoteRealm registrations to have a clean slate - the relevant
+        # tests want to construct this from scratch.
+        RemoteRealm.objects.all().delete()
 
     # Lightweight creation of users, streams, and messages
     def create_user(self, **kwargs: Any) -> UserProfile:
@@ -100,7 +133,7 @@ class AnalyticsTestCase(ZulipTestCase):
         for key, value in defaults.items():
             kwargs[key] = kwargs.get(key, value)
         kwargs["delivery_email"] = kwargs["email"]
-        with mock.patch("zerver.lib.create_user.timezone_now", return_value=kwargs["date_joined"]):
+        with time_machine.travel(kwargs["date_joined"], tick=False):
             pass_kwargs: Dict[str, Any] = {}
             if kwargs["is_bot"]:
                 pass_kwargs["bot_type"] = UserProfile.DEFAULT_BOT
@@ -121,6 +154,7 @@ class AnalyticsTestCase(ZulipTestCase):
             "name": f"stream name {self.name_counter}",
             "realm": self.default_realm,
             "date_created": self.TIME_LAST_HOUR,
+            "can_remove_subscribers_group": self.administrators_user_group,
         }
         for key, value in defaults.items():
             kwargs[key] = kwargs.get(key, value)
@@ -149,13 +183,18 @@ class AnalyticsTestCase(ZulipTestCase):
             "content": "hi",
             "date_sent": self.TIME_LAST_HOUR,
             "sending_client": get_client("website"),
+            "realm_id": sender.realm_id,
         }
+        # For simplicity, this helper doesn't support creating cross-realm messages
+        # since it'd require adding an additional realm argument.
+        assert not is_cross_realm_bot_email(sender.delivery_email)
+
         for key, value in defaults.items():
             kwargs[key] = kwargs.get(key, value)
         return Message.objects.create(**kwargs)
 
     # kwargs should only ever be a UserProfile or Stream.
-    def assertCountEquals(
+    def assert_table_count(
         self,
         table: Type[BaseCount],
         value: int,
@@ -167,7 +206,9 @@ class AnalyticsTestCase(ZulipTestCase):
     ) -> None:
         if property is None:
             property = self.current_property
-        queryset = table.objects.filter(property=property, end_time=end_time).filter(**kwargs)
+        queryset = table._default_manager.filter(property=property, end_time=end_time).filter(
+            **kwargs
+        )
         if table is not InstallationCount:
             if realm is None:
                 realm = self.default_realm
@@ -212,16 +253,18 @@ class AnalyticsTestCase(ZulipTestCase):
                 kwargs[arg_keys[i]] = values[i]
             for key, value in defaults.items():
                 kwargs[key] = kwargs.get(key, value)
-            if table is not InstallationCount:
-                if "realm" not in kwargs:
-                    if "user" in kwargs:
-                        kwargs["realm"] = kwargs["user"].realm
-                    elif "stream" in kwargs:
-                        kwargs["realm"] = kwargs["stream"].realm
-                    else:
-                        kwargs["realm"] = self.default_realm
-            self.assertEqual(table.objects.filter(**kwargs).count(), 1)
-        self.assert_length(arg_values, table.objects.count())
+            if (
+                table not in [InstallationCount, RemoteInstallationCount, RemoteRealmCount]
+                and "realm" not in kwargs
+            ):
+                if "user" in kwargs:
+                    kwargs["realm"] = kwargs["user"].realm
+                elif "stream" in kwargs:
+                    kwargs["realm"] = kwargs["stream"].realm
+                else:
+                    kwargs["realm"] = self.default_realm
+            self.assertEqual(table._default_manager.filter(**kwargs).count(), 1)
+        self.assert_length(arg_values, table._default_manager.count())
 
 
 class TestProcessCountStat(AnalyticsTestCase):
@@ -275,7 +318,7 @@ class TestProcessCountStat(AnalyticsTestCase):
         stat = self.make_dummy_count_stat("test stat")
         with self.assertRaises(ValueError):
             process_count_stat(stat, installation_epoch() + 65 * self.MINUTE)
-        with self.assertRaises(TimezoneNotUTCException):
+        with self.assertRaises(TimeZoneNotUTCError):
             process_count_stat(stat, installation_epoch().replace(tzinfo=None))
 
     # This tests the LoggingCountStat branch of the code in do_delete_counts_at_hour.
@@ -439,6 +482,7 @@ class TestProcessCountStat(AnalyticsTestCase):
 
 
 class TestCountStats(AnalyticsTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         # This tests two things for each of the queries/CountStats: Handling
@@ -643,7 +687,7 @@ class TestCountStats(AnalyticsTestCase):
         self.create_message(user1, recipient_huddle1)
         self.create_message(user2, recipient_huddle2)
 
-        # private messages
+        # direct messages
         recipient_user1 = Recipient.objects.get(type_id=user1.id, type=Recipient.PERSONAL)
         recipient_user2 = Recipient.objects.get(type_id=user2.id, type=Recipient.PERSONAL)
         recipient_user3 = Recipient.objects.get(type_id=user3.id, type=Recipient.PERSONAL)
@@ -759,9 +803,9 @@ class TestCountStats(AnalyticsTestCase):
 
         do_fill_count_stat_at_hour(stat, self.TIME_ZERO)
 
-        self.assertCountEquals(UserCount, 1, subgroup="private_message")
-        self.assertCountEquals(UserCount, 1, subgroup="huddle_message")
-        self.assertCountEquals(UserCount, 1, subgroup="public_stream")
+        self.assert_table_count(UserCount, 1, subgroup="private_message")
+        self.assert_table_count(UserCount, 1, subgroup="huddle_message")
+        self.assert_table_count(UserCount, 1, subgroup="public_stream")
 
     def test_messages_sent_by_client(self) -> None:
         stat = COUNT_STATS["messages_sent:client:day"]
@@ -1353,6 +1397,252 @@ class TestLoggingCountStats(AnalyticsTestCase):
             ],
         )
 
+    @override_settings(PUSH_NOTIFICATION_BOUNCER_URL="https://push.zulip.org.example.com")
+    def test_mobile_pushes_received_count(self) -> None:
+        self.server_uuid = "6cde5f7a-1f7e-4978-9716-49f69ebfc9fe"
+        self.server = RemoteZulipServer.objects.create(
+            uuid=self.server_uuid,
+            api_key="magic_secret_api_key",
+            hostname="demo.example.com",
+            last_updated=timezone_now(),
+        )
+
+        hamlet = self.example_user("hamlet")
+        token = "aaaa"
+
+        RemotePushDeviceToken.objects.create(
+            kind=RemotePushDeviceToken.GCM,
+            token=hex_to_b64(token),
+            user_uuid=(hamlet.uuid),
+            server=self.server,
+        )
+        RemotePushDeviceToken.objects.create(
+            kind=RemotePushDeviceToken.GCM,
+            token=hex_to_b64(token + "aa"),
+            user_uuid=(hamlet.uuid),
+            server=self.server,
+        )
+        RemotePushDeviceToken.objects.create(
+            kind=RemotePushDeviceToken.APNS,
+            token=hex_to_b64(token),
+            user_uuid=str(hamlet.uuid),
+            server=self.server,
+        )
+
+        message = Message(
+            sender=hamlet,
+            recipient=self.example_user("othello").recipient,
+            realm_id=hamlet.realm_id,
+            content="This is test content",
+            rendered_content="This is test content",
+            date_sent=timezone_now(),
+            sending_client=get_client("test"),
+        )
+        message.set_topic_name("Test topic")
+        message.save()
+        gcm_payload, gcm_options = get_message_payload_gcm(hamlet, message)
+        apns_payload = get_message_payload_apns(
+            hamlet, message, NotificationTriggers.DIRECT_MESSAGE
+        )
+
+        # First we'll make a request without providing realm_uuid. That means
+        # the bouncer can't increment the RemoteRealmCount stat, and only
+        # RemoteInstallationCount will be incremented.
+        payload = {
+            "user_id": hamlet.id,
+            "user_uuid": str(hamlet.uuid),
+            "gcm_payload": gcm_payload,
+            "apns_payload": apns_payload,
+            "gcm_options": gcm_options,
+        }
+        now = timezone_now()
+        with time_machine.travel(now, tick=False), mock.patch(
+            "zilencer.views.send_android_push_notification", return_value=1
+        ), mock.patch("zilencer.views.send_apple_push_notification", return_value=1), mock.patch(
+            "corporate.lib.stripe.RemoteServerBillingSession.current_count_for_billed_licenses",
+            return_value=10,
+        ), self.assertLogs(
+            "zilencer.views", level="INFO"
+        ):
+            result = self.uuid_post(
+                self.server_uuid,
+                "/api/v1/remotes/push/notify",
+                payload,
+                content_type="application/json",
+                subdomain="",
+            )
+            self.assert_json_success(result)
+
+        # There are 3 devices we created for the user:
+        # 1. The mobile_pushes_received increment should match that number.
+        # 2. mobile_pushes_forwarded only counts successful deliveries, and we've set up
+        #    the mocks above to simulate 1 successful android and 1 successful apple delivery.
+        #    Thus the increment should be just 2.
+        self.assertTableState(
+            RemoteInstallationCount,
+            ["property", "value", "subgroup", "server", "remote_id", "end_time"],
+            [
+                [
+                    "mobile_pushes_received::day",
+                    3,
+                    None,
+                    self.server,
+                    None,
+                    ceiling_to_day(now),
+                ],
+                [
+                    "mobile_pushes_forwarded::day",
+                    2,
+                    None,
+                    self.server,
+                    None,
+                    ceiling_to_day(now),
+                ],
+            ],
+        )
+        self.assertFalse(
+            RemoteRealmCount.objects.filter(property="mobile_pushes_received::day").exists()
+        )
+        self.assertFalse(
+            RemoteRealmCount.objects.filter(property="mobile_pushes_forwarded::day").exists()
+        )
+
+        # Now provide the realm_uuid. However, the RemoteRealm record doesn't exist yet, so it'll
+        # still be ignored.
+        payload = {
+            "user_id": hamlet.id,
+            "user_uuid": str(hamlet.uuid),
+            "realm_uuid": str(hamlet.realm.uuid),
+            "gcm_payload": gcm_payload,
+            "apns_payload": apns_payload,
+            "gcm_options": gcm_options,
+        }
+        with time_machine.travel(now, tick=False), mock.patch(
+            "zilencer.views.send_android_push_notification", return_value=1
+        ), mock.patch("zilencer.views.send_apple_push_notification", return_value=1), mock.patch(
+            "corporate.lib.stripe.RemoteServerBillingSession.current_count_for_billed_licenses",
+            return_value=10,
+        ), self.assertLogs(
+            "zilencer.views", level="INFO"
+        ):
+            result = self.uuid_post(
+                self.server_uuid,
+                "/api/v1/remotes/push/notify",
+                payload,
+                content_type="application/json",
+                subdomain="",
+            )
+            self.assert_json_success(result)
+
+        # The RemoteInstallationCount records get incremented again, but the RemoteRealmCount
+        # remains ignored due to missing RemoteRealm record.
+        self.assertTableState(
+            RemoteInstallationCount,
+            ["property", "value", "subgroup", "server", "remote_id", "end_time"],
+            [
+                [
+                    "mobile_pushes_received::day",
+                    6,
+                    None,
+                    self.server,
+                    None,
+                    ceiling_to_day(now),
+                ],
+                [
+                    "mobile_pushes_forwarded::day",
+                    4,
+                    None,
+                    self.server,
+                    None,
+                    ceiling_to_day(now),
+                ],
+            ],
+        )
+        self.assertFalse(
+            RemoteRealmCount.objects.filter(property="mobile_pushes_received::day").exists()
+        )
+        self.assertFalse(
+            RemoteRealmCount.objects.filter(property="mobile_pushes_forwarded::day").exists()
+        )
+
+        # Create the RemoteRealm registration and repeat the above. This time RemoteRealmCount
+        # stats should be collected.
+        realm = hamlet.realm
+        remote_realm = RemoteRealm.objects.create(
+            server=self.server,
+            uuid=realm.uuid,
+            uuid_owner_secret=realm.uuid_owner_secret,
+            host=realm.host,
+            realm_deactivated=realm.deactivated,
+            realm_date_created=realm.date_created,
+        )
+
+        with time_machine.travel(now, tick=False), mock.patch(
+            "zilencer.views.send_android_push_notification", return_value=1
+        ), mock.patch("zilencer.views.send_apple_push_notification", return_value=1), mock.patch(
+            "corporate.lib.stripe.RemoteServerBillingSession.current_count_for_billed_licenses",
+            return_value=10,
+        ), self.assertLogs(
+            "zilencer.views", level="INFO"
+        ):
+            result = self.uuid_post(
+                self.server_uuid,
+                "/api/v1/remotes/push/notify",
+                payload,
+                content_type="application/json",
+                subdomain="",
+            )
+            self.assert_json_success(result)
+
+        # The RemoteInstallationCount records get incremented again, and the RemoteRealmCount
+        # gets collected.
+        self.assertTableState(
+            RemoteInstallationCount,
+            ["property", "value", "subgroup", "server", "remote_id", "end_time"],
+            [
+                [
+                    "mobile_pushes_received::day",
+                    9,
+                    None,
+                    self.server,
+                    None,
+                    ceiling_to_day(now),
+                ],
+                [
+                    "mobile_pushes_forwarded::day",
+                    6,
+                    None,
+                    self.server,
+                    None,
+                    ceiling_to_day(now),
+                ],
+            ],
+        )
+        self.assertTableState(
+            RemoteRealmCount,
+            ["property", "value", "subgroup", "server", "remote_realm", "remote_id", "end_time"],
+            [
+                [
+                    "mobile_pushes_received::day",
+                    3,
+                    None,
+                    self.server,
+                    remote_realm,
+                    None,
+                    ceiling_to_day(now),
+                ],
+                [
+                    "mobile_pushes_forwarded::day",
+                    2,
+                    None,
+                    self.server,
+                    remote_realm,
+                    None,
+                    ceiling_to_day(now),
+                ],
+            ],
+        )
+
     def test_invites_sent(self) -> None:
         property = "invites_sent::day"
 
@@ -1367,47 +1657,49 @@ class TestLoggingCountStats(AnalyticsTestCase):
         user = self.create_user(email="first@domain.tld")
         stream, _ = self.create_stream_with_recipient()
 
-        invite_expires_in_days = 2
-        do_invite_users(
-            user,
-            ["user1@domain.tld", "user2@domain.tld"],
-            [stream],
-            invite_expires_in_days=invite_expires_in_days,
-        )
+        invite_expires_in_minutes = 2 * 24 * 60
+        with mock.patch("zerver.actions.invites.too_many_recent_realm_invites", return_value=False):
+            do_invite_users(
+                user,
+                ["user1@domain.tld", "user2@domain.tld"],
+                [stream],
+                invite_expires_in_minutes=invite_expires_in_minutes,
+            )
         assertInviteCountEquals(2)
 
         # We currently send emails when re-inviting users that haven't
         # turned into accounts, so count them towards the total
-        do_invite_users(
-            user,
-            ["user1@domain.tld", "user2@domain.tld"],
-            [stream],
-            invite_expires_in_days=invite_expires_in_days,
-        )
+        with mock.patch("zerver.actions.invites.too_many_recent_realm_invites", return_value=False):
+            do_invite_users(
+                user,
+                ["user1@domain.tld", "user2@domain.tld"],
+                [stream],
+                invite_expires_in_minutes=invite_expires_in_minutes,
+            )
         assertInviteCountEquals(4)
 
         # Test mix of good and malformed invite emails
-        try:
+        with self.assertRaises(InvitationError), mock.patch(
+            "zerver.actions.invites.too_many_recent_realm_invites", return_value=False
+        ):
             do_invite_users(
                 user,
                 ["user3@domain.tld", "malformed"],
                 [stream],
-                invite_expires_in_days=invite_expires_in_days,
+                invite_expires_in_minutes=invite_expires_in_minutes,
             )
-        except InvitationError:
-            pass
         assertInviteCountEquals(4)
 
         # Test inviting existing users
-        try:
+        with self.assertRaises(InvitationError), mock.patch(
+            "zerver.actions.invites.too_many_recent_realm_invites", return_value=False
+        ):
             do_invite_users(
                 user,
                 ["first@domain.tld", "user4@domain.tld"],
                 [stream],
-                invite_expires_in_days=invite_expires_in_days,
+                invite_expires_in_minutes=invite_expires_in_minutes,
             )
-        except InvitationError:
-            pass
         assertInviteCountEquals(5)
 
         # Revoking invite should not give you credit
@@ -1417,7 +1709,8 @@ class TestLoggingCountStats(AnalyticsTestCase):
         assertInviteCountEquals(5)
 
         # Resending invite should cost you
-        do_resend_user_invite_email(assert_is_not_none(PreregistrationUser.objects.first()))
+        with mock.patch("zerver.actions.invites.too_many_recent_realm_invites", return_value=False):
+            do_resend_user_invite_email(assert_is_not_none(PreregistrationUser.objects.first()))
         assertInviteCountEquals(6)
 
     def test_messages_read_hour(self) -> None:
@@ -1431,8 +1724,7 @@ class TestLoggingCountStats(AnalyticsTestCase):
         self.subscribe(user2, stream.name)
 
         self.send_personal_message(user1, user2)
-        client = get_client("website")
-        do_mark_all_as_read(user2, client)
+        do_mark_all_as_read(user2)
         self.assertEqual(
             1,
             UserCount.objects.filter(property=read_count_property).aggregate(Sum("value"))[
@@ -1463,7 +1755,7 @@ class TestLoggingCountStats(AnalyticsTestCase):
         )
 
         message = self.send_stream_message(user2, stream.name)
-        do_update_message_flags(user1, client, "add", "read", [message])
+        do_update_message_flags(user1, "add", "read", [message])
         self.assertEqual(
             4,
             UserCount.objects.filter(property=read_count_property).aggregate(Sum("value"))[
@@ -1491,12 +1783,12 @@ class TestDeleteStats(AnalyticsTestCase):
         FillState.objects.create(property="test", end_time=self.TIME_ZERO, state=FillState.DONE)
 
         analytics = apps.get_app_config("analytics")
-        for table in list(analytics.models.values()):
-            self.assertTrue(table.objects.exists())
+        for table in analytics.models.values():
+            self.assertTrue(table._default_manager.exists())
 
         do_drop_all_analytics_tables()
-        for table in list(analytics.models.values()):
-            self.assertFalse(table.objects.exists())
+        for table in analytics.models.values():
+            self.assertFalse(table._default_manager.exists())
 
     def test_do_drop_single_stat(self) -> None:
         user = self.create_user()
@@ -1515,16 +1807,17 @@ class TestDeleteStats(AnalyticsTestCase):
         FillState.objects.create(property="to_save", end_time=self.TIME_ZERO, state=FillState.DONE)
 
         analytics = apps.get_app_config("analytics")
-        for table in list(analytics.models.values()):
-            self.assertTrue(table.objects.exists())
+        for table in analytics.models.values():
+            self.assertTrue(table._default_manager.exists())
 
         do_drop_single_stat("to_delete")
-        for table in list(analytics.models.values()):
-            self.assertFalse(table.objects.filter(property="to_delete").exists())
-            self.assertTrue(table.objects.filter(property="to_save").exists())
+        for table in analytics.models.values():
+            self.assertFalse(table._default_manager.filter(property="to_delete").exists())
+            self.assertTrue(table._default_manager.filter(property="to_save").exists())
 
 
 class TestActiveUsersAudit(AnalyticsTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user = self.create_user()
@@ -1707,6 +2000,7 @@ class TestActiveUsersAudit(AnalyticsTestCase):
 
 
 class TestRealmActiveHumans(AnalyticsTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.stat = COUNT_STATS["realm_active_humans::day"]
@@ -1826,3 +2120,26 @@ class TestRealmActiveHumans(AnalyticsTestCase):
             1,
         )
         self.assertEqual(RealmCount.objects.filter(property="realm_active_humans::day").count(), 1)
+
+
+class GetLastIdFromServerTest(ZulipTestCase):
+    def test_get_last_id_from_server_ignores_null(self) -> None:
+        """
+        Verifies that get_last_id_from_server ignores null remote_ids, since this goes
+        against the default Postgres ordering behavior, which treats nulls as the largest value.
+        """
+        self.server_uuid = "6cde5f7a-1f7e-4978-9716-49f69ebfc9fe"
+        self.server = RemoteZulipServer.objects.create(
+            uuid=self.server_uuid,
+            api_key="magic_secret_api_key",
+            hostname="demo.example.com",
+            last_updated=timezone_now(),
+        )
+        first = RemoteInstallationCount.objects.create(
+            end_time=timezone_now(), server=self.server, property="test", value=1, remote_id=1
+        )
+        RemoteInstallationCount.objects.create(
+            end_time=timezone_now(), server=self.server, property="test2", value=1, remote_id=None
+        )
+        result = get_last_id_from_server(self.server, RemoteInstallationCount)
+        self.assertEqual(result, first.remote_id)

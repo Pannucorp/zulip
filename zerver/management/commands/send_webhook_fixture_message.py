@@ -5,10 +5,11 @@ import orjson
 from django.conf import settings
 from django.core.management.base import CommandError, CommandParser
 from django.test import Client
+from typing_extensions import override
 
 from zerver.lib.management import ZulipBaseCommand
 from zerver.lib.webhooks.common import standardize_headers
-from zerver.models import get_realm
+from zerver.models.realms import get_realm
 
 
 class Command(ZulipBaseCommand):
@@ -30,9 +31,10 @@ not contain any spaces in them and that you use the precise quoting
 approach shown above.
 """
 
+    @override
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
-            "-f", "--fixture", help="The path to the fixture you'd like to send " "into Zulip"
+            "-f", "--fixture", help="The path to the fixture you'd like to send into Zulip"
         )
 
         parser.add_argument(
@@ -56,11 +58,12 @@ approach shown above.
             custom_headers_dict = orjson.loads(custom_headers)
         except orjson.JSONDecodeError as ve:
             raise CommandError(
-                "Encountered an error while attempting to parse custom headers: {}\n"
-                "Note: all strings must be enclosed within \"\" instead of ''".format(ve)
+                f"Encountered an error while attempting to parse custom headers: {ve}\n"
+                "Note: all strings must be enclosed within \"\" instead of ''"
             )
         return standardize_headers(custom_headers_dict)
 
+    @override
     def handle(self, *args: Any, **options: Optional[str]) -> None:
         if options["fixture"] is None or options["url"] is None:
             self.print_help("./manage.py", "send_webhook_fixture_message")
@@ -91,7 +94,7 @@ approach shown above.
                 options["url"], json, content_type="application/json", HTTP_HOST=realm.host
             )
         if result.status_code != 200:
-            raise CommandError(f"Error status {result.status_code}: {result.content}")
+            raise CommandError(f"Error status {result.status_code}: {result.content!r}")
 
     def _does_fixture_path_exist(self, fixture_path: str) -> bool:
         return os.path.exists(fixture_path)

@@ -3,6 +3,7 @@ import os
 import subprocess
 from typing import Optional
 
+import lxml.html
 from django.conf import settings
 
 from zerver.lib.storage import static_path
@@ -34,10 +35,23 @@ def render_tex(tex: str, is_inline: bool = True) -> Optional[str]:
     if not is_inline:
         command.extend(["--display-mode"])
     try:
-        stdout = subprocess.check_output(
-            command, input=tex, stderr=subprocess.DEVNULL, universal_newlines=True
-        )
+        stdout = subprocess.check_output(command, input=tex, stderr=subprocess.DEVNULL, text=True)
         # stdout contains a newline at the end
         return stdout.strip()
     except subprocess.CalledProcessError:
         return None
+
+
+def change_katex_to_raw_latex(fragment: lxml.html.HtmlElement) -> None:
+    # Selecting the <span> elements with class 'katex'
+    katex_spans = fragment.xpath("//span[@class='katex']")
+
+    # Iterate through 'katex_spans' and replace with a new <span> having LaTeX text.
+    for katex_span in katex_spans:
+        latex_text = katex_span.xpath(".//annotation[@encoding='application/x-tex']")[0].text
+        # We store 'tail' to insert them back as the replace operation removes it.
+        tail = katex_span.tail
+        latex_span = lxml.html.Element("span")
+        latex_span.text = f"$${latex_text}$$"
+        katex_span.getparent().replace(katex_span, latex_span)
+        latex_span.tail = tail

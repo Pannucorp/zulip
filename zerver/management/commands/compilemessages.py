@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import unicodedata
 from subprocess import CalledProcessError, check_output
 from typing import Any, Dict, List
 
@@ -14,9 +15,11 @@ from django.utils.translation import gettext as _
 from django.utils.translation import override as override_language
 from django.utils.translation import to_language
 from pyuca import Collator
+from typing_extensions import override
 
 
 class Command(compilemessages.Command):
+    @override
     def add_arguments(self, parser: CommandParser) -> None:
         super().add_arguments(parser)
 
@@ -24,6 +27,7 @@ class Command(compilemessages.Command):
             "--strict", "-s", action="store_true", help="Stop execution in case of errors."
         )
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         super().handle(*args, **options)
         self.strict = options["strict"]
@@ -70,7 +74,7 @@ class Command(compilemessages.Command):
             raise Exception(f"Unknown language {locale}")
 
     def get_locales(self) -> List[str]:
-        output = check_output(["git", "ls-files", "locale"], universal_newlines=True)
+        output = check_output(["git", "ls-files", "locale"], text=True)
         tracked_files = output.split()
         regex = re.compile(r"locale/(\w+)/LC_MESSAGES/django.po")
         locales = ["en"]
@@ -96,7 +100,7 @@ class Command(compilemessages.Command):
             locales.append("en")
             locales = list(set(locales))
 
-        for locale in locales:
+        for locale in sorted(locales):
             if locale == "en":
                 data["languages"].append(
                     {
@@ -126,8 +130,8 @@ class Command(compilemessages.Command):
                 with override_language(code):
                     name_local = _(name)
 
-            info["name"] = name
-            info["name_local"] = name_local
+            info["name"] = unicodedata.normalize("NFC", name)
+            info["name_local"] = unicodedata.normalize("NFC", name_local)
             info["code"] = code
             info["locale"] = locale
             info["percent_translated"] = percentage
@@ -138,7 +142,6 @@ class Command(compilemessages.Command):
             writer.write("\n")
 
     def get_translation_percentage(self, locale_path: str, locale: str) -> int:
-
         # backend stats
         po = polib.pofile(self.get_po_filename(locale_path, locale))
         not_translated = len(po.untranslated_entries())
@@ -146,7 +149,7 @@ class Command(compilemessages.Command):
 
         # frontend stats
         with open(self.get_json_filename(locale_path, locale), "rb") as reader:
-            for key, value in orjson.loads(reader.read()).items():
+            for value in orjson.loads(reader.read()).values():
                 total += 1
                 if value == "":
                     not_translated += 1

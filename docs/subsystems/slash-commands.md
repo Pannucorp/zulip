@@ -29,7 +29,7 @@ the round trip time and shows a little message above
 the compose box that the user can see and then dismiss.
 
 For commands like "/light" and "/dark", the server does
-a little bit of logic to toggle the user's dark mode
+a little bit of logic to toggle the user's dark theme
 setting, and this is largely done inside `zcommand.py`.
 The server sends a very basic response, and then
 the client actually changes the display colors. The
@@ -52,4 +52,4 @@ send a message with the raw content.
 ## Typeahead
 
 Typeahead for both slash commands (and widgets) is implemented
-via the `slash_commands` object in `static/js/composebox_typeahead.js`.
+via the `slash_commands` object in `web/src/composebox_typeahead.js`.

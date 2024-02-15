@@ -3,10 +3,9 @@ from typing import Iterable, List, Optional, Sequence, Union, cast
 from django.utils.translation import gettext as _
 
 from zerver.lib.exceptions import JsonableError
-from zerver.models import (
-    Realm,
-    Stream,
-    UserProfile,
+from zerver.lib.string_validation import check_stream_topic
+from zerver.models import Realm, Stream, UserProfile
+from zerver.models.users import (
     get_user_by_id_in_realm_including_cross_realm,
     get_user_including_cross_realm,
 )
@@ -18,7 +17,7 @@ def get_user_profiles(emails: Iterable[str], realm: Realm) -> List[UserProfile]:
         try:
             user_profile = get_user_including_cross_realm(email, realm)
         except UserProfile.DoesNotExist:
-            raise JsonableError(_("Invalid email '{}'").format(email))
+            raise JsonableError(_("Invalid email '{email}'").format(email=email))
         user_profiles.append(user_profile)
     return user_profiles
 
@@ -29,18 +28,9 @@ def get_user_profiles_by_ids(user_ids: Iterable[int], realm: Realm) -> List[User
         try:
             user_profile = get_user_by_id_in_realm_including_cross_realm(user_id, realm)
         except UserProfile.DoesNotExist:
-            raise JsonableError(_("Invalid user ID {}").format(user_id))
+            raise JsonableError(_("Invalid user ID {user_id}").format(user_id=user_id))
         user_profiles.append(user_profile)
     return user_profiles
-
-
-def validate_topic(topic: str) -> str:
-    assert topic is not None
-    topic = topic.strip()
-    if topic == "":
-        raise JsonableError(_("Topic can't be empty"))
-
-    return topic
 
 
 class Addressee:
@@ -48,8 +38,8 @@ class Addressee:
     # around in a non-type-safe way before this class was introduced.
     #
     # It also avoids some nonsense where you have to think about whether
-    # topic should be None or '' for a PM, or you have to make an array
-    # of one stream.
+    # topic should be None or '' for a direct message, or you have to
+    # make an array of one stream.
     #
     # Eventually we can use this to cache Stream and UserProfile objects
     # in memory.
@@ -62,17 +52,17 @@ class Addressee:
         stream: Optional[Stream] = None,
         stream_name: Optional[str] = None,
         stream_id: Optional[int] = None,
-        topic: Optional[str] = None,
+        topic_name: Optional[str] = None,
     ) -> None:
         assert msg_type in ["stream", "private"]
-        if msg_type == "stream" and topic is None:
+        if msg_type == "stream" and topic_name is None:
             raise JsonableError(_("Missing topic"))
         self._msg_type = msg_type
         self._user_profiles = user_profiles
         self._stream = stream
         self._stream_name = stream_name
         self._stream_id = stream_id
-        self._topic = topic
+        self._topic_name = topic_name
 
     def is_stream(self) -> bool:
         return self._msg_type == "stream"
@@ -97,27 +87,26 @@ class Addressee:
         assert self.is_stream()
         return self._stream_id
 
-    def topic(self) -> str:
+    def topic_name(self) -> str:
         assert self.is_stream()
-        assert self._topic is not None
-        return self._topic
+        assert self._topic_name is not None
+        return self._topic_name
 
     @staticmethod
     def legacy_build(
         sender: UserProfile,
-        message_type_name: str,
+        recipient_type_name: str,
         message_to: Union[Sequence[int], Sequence[str]],
         topic_name: Optional[str],
         realm: Optional[Realm] = None,
     ) -> "Addressee":
-
         # For legacy reason message_to used to be either a list of
         # emails or a list of streams.  We haven't fixed all of our
         # callers yet.
         if realm is None:
             realm = sender.realm
 
-        if message_type_name == "stream":
+        if recipient_type_name == "stream":
             if len(message_to) > 1:
                 raise JsonableError(_("Cannot send to multiple streams"))
 
@@ -126,10 +115,10 @@ class Addressee:
             else:
                 # This is a hack to deal with the fact that we still support
                 # default streams (and the None will be converted later in the
-                # callpath).
-                if sender.default_sending_stream:
-                    # Use the users default stream
-                    stream_name_or_id = sender.default_sending_stream.id
+                # call path).
+                if sender.default_sending_stream_id:
+                    # Use the user's default stream
+                    stream_name_or_id = sender.default_sending_stream_id
                 else:
                     raise JsonableError(_("Missing stream"))
 
@@ -140,7 +129,7 @@ class Addressee:
                 return Addressee.for_stream_id(stream_name_or_id, topic_name)
 
             return Addressee.for_stream_name(stream_name_or_id, topic_name)
-        elif message_type_name == "private":
+        elif recipient_type_name == "private":
             if not message_to:
                 raise JsonableError(_("Message must have recipients"))
 
@@ -154,30 +143,33 @@ class Addressee:
             raise JsonableError(_("Invalid message type"))
 
     @staticmethod
-    def for_stream(stream: Stream, topic: str) -> "Addressee":
-        topic = validate_topic(topic)
+    def for_stream(stream: Stream, topic_name: str) -> "Addressee":
+        topic_name = topic_name.strip()
+        check_stream_topic(topic_name)
         return Addressee(
             msg_type="stream",
             stream=stream,
-            topic=topic,
+            topic_name=topic_name,
         )
 
     @staticmethod
-    def for_stream_name(stream_name: str, topic: str) -> "Addressee":
-        topic = validate_topic(topic)
+    def for_stream_name(stream_name: str, topic_name: str) -> "Addressee":
+        topic_name = topic_name.strip()
+        check_stream_topic(topic_name)
         return Addressee(
             msg_type="stream",
             stream_name=stream_name,
-            topic=topic,
+            topic_name=topic_name,
         )
 
     @staticmethod
-    def for_stream_id(stream_id: int, topic: str) -> "Addressee":
-        topic = validate_topic(topic)
+    def for_stream_id(stream_id: int, topic_name: str) -> "Addressee":
+        topic_name = topic_name.strip()
+        check_stream_topic(topic_name)
         return Addressee(
             msg_type="stream",
             stream_id=stream_id,
-            topic=topic,
+            topic_name=topic_name,
         )
 
     @staticmethod

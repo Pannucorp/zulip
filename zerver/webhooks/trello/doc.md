@@ -9,7 +9,9 @@ Get Zulip notifications from your Trello boards!
 
 1. {!create-stream.md!}
 
-1. {!create-bot-construct-url-indented.md!}
+1. {!create-an-incoming-webhook.md!}
+
+1. {!generate-integration-url.md!}
 
 1. **Log in to Trello**, and collect the following three items:
 
@@ -28,7 +30,7 @@ Get Zulip notifications from your Trello boards!
     computer (any computer) connected to the internet. It won't make any
     changes to the computer.
 
-1.  Make sure you have a working copy of Python. If you're running
+1. Make sure you have a working copy of Python. If you're running
     macOS or Linux, you very likely already do. If you're running
     Windows you may or may not.  If you don't have Python, follow the
     installation instructions

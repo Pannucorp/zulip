@@ -1,6 +1,7 @@
 import abc
 import json
 import logging
+from contextlib import suppress
 from time import perf_counter
 from typing import Any, AnyStr, Dict, Optional
 
@@ -8,24 +9,20 @@ import requests
 from django.conf import settings
 from django.utils.translation import gettext as _
 from requests import Response
+from typing_extensions import override
 
 from version import ZULIP_VERSION
-from zerver.lib.actions import check_send_message
-from zerver.lib.exceptions import JsonableError
-from zerver.lib.message import MessageDict
+from zerver.actions.message_send import check_send_message
+from zerver.lib.exceptions import JsonableError, StreamDoesNotExistError
+from zerver.lib.message_cache import MessageDict
 from zerver.lib.outgoing_http import OutgoingSession
 from zerver.lib.queue import retry_event
 from zerver.lib.topic import get_topic_from_message_info
 from zerver.lib.url_encoding import near_message_url
-from zerver.models import (
-    GENERIC_INTERFACE,
-    SLACK_INTERFACE,
-    Realm,
-    Service,
-    UserProfile,
-    get_client,
-    get_user_profile_by_id,
-)
+from zerver.models import Realm, Service, UserProfile
+from zerver.models.bots import GENERIC_INTERFACE, SLACK_INTERFACE
+from zerver.models.clients import get_client
+from zerver.models.users import get_user_profile_by_id
 
 
 class OutgoingWebhookServiceInterface(metaclass=abc.ABCMeta):
@@ -35,7 +32,7 @@ class OutgoingWebhookServiceInterface(metaclass=abc.ABCMeta):
         self.service_name: str = service_name
         self.session: requests.Session = OutgoingSession(
             role="webhook",
-            timeout=10,
+            timeout=settings.OUTGOING_WEBHOOK_TIMEOUT_SECONDS,
             headers={"User-Agent": "ZulipOutgoingWebhook/" + ZULIP_VERSION},
         )
 
@@ -51,6 +48,7 @@ class OutgoingWebhookServiceInterface(metaclass=abc.ABCMeta):
 
 
 class GenericOutgoingWebhookService(OutgoingWebhookServiceInterface):
+    @override
     def make_request(
         self, base_url: str, event: Dict[str, Any], realm: Realm
     ) -> Optional[Response]:
@@ -81,8 +79,9 @@ class GenericOutgoingWebhookService(OutgoingWebhookServiceInterface):
 
         return self.session.post(base_url, json=request_data)
 
+    @override
     def process_success(self, response_json: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if "response_not_required" in response_json and response_json["response_not_required"]:
+        if response_json.get("response_not_required", False):
             return None
 
         if "response_string" in response_json:
@@ -102,11 +101,12 @@ class GenericOutgoingWebhookService(OutgoingWebhookServiceInterface):
 
 
 class SlackOutgoingWebhookService(OutgoingWebhookServiceInterface):
+    @override
     def make_request(
         self, base_url: str, event: Dict[str, Any], realm: Realm
     ) -> Optional[Response]:
         if event["message"]["type"] == "private":
-            failure_message = "Slack outgoing webhooks don't support private messages."
+            failure_message = "Slack outgoing webhooks don't support direct messages."
             fail_with_message(event, failure_message)
             return None
 
@@ -141,6 +141,7 @@ class SlackOutgoingWebhookService(OutgoingWebhookServiceInterface):
         ]
         return self.session.post(base_url, data=request_data)
 
+    @override
     def process_success(self, response_json: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if "text" in response_json:
             content = response_json["text"]
@@ -164,7 +165,6 @@ def get_service_interface_class(interface: str) -> Any:
 
 
 def get_outgoing_webhook_service_handler(service: Service) -> Any:
-
     service_interface_class = get_service_interface_class(service.interface_name())
     service_interface = service_interface_class(
         token=service.token, user_profile=service.user_profile, service_name=service.name
@@ -191,7 +191,7 @@ def send_response_message(
     that might let someone send arbitrary messages to any stream through this.
     """
 
-    message_type = message_info["type"]
+    recipient_type_name = message_info["type"]
     display_recipient = message_info["display_recipient"]
     try:
         topic_name: Optional[str] = get_topic_from_message_info(message_info)
@@ -207,9 +207,9 @@ def send_response_message(
 
     widget_content = response_data.get("widget_content")
 
-    if message_type == "stream":
+    if recipient_type_name == "stream":
         message_to = [display_recipient]
-    elif message_type == "private":
+    elif recipient_type_name == "private":
         message_to = [recipient["email"] for recipient in display_recipient]
     else:
         raise JsonableError(_("Invalid message type"))
@@ -217,7 +217,7 @@ def send_response_message(
     check_send_message(
         sender=bot_user,
         client=client,
-        message_type_name=message_type,
+        recipient_type_name=recipient_type_name,
         message_to=message_to,
         topic_name=topic_name,
         message_content=content,
@@ -232,7 +232,10 @@ def fail_with_message(event: Dict[str, Any], failure_message: str) -> None:
     message_info = event["message"]
     content = "Failure! " + failure_message
     response_data = dict(content=content)
-    send_response_message(bot_id=bot_id, message_info=message_info, response_data=response_data)
+    # If the stream has vanished while we were failing, there's no
+    # reasonable place to report the error.
+    with suppress(StreamDoesNotExistError):
+        send_response_message(bot_id=bot_id, message_info=message_info, response_data=response_data)
 
 
 def get_message_url(event: Dict[str, Any]) -> str:

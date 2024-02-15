@@ -6,12 +6,13 @@ maxdepth: 3
 ---
 
 requirements
-Installing a production server <install>
+install
 troubleshooting
 management-commands
 settings
 mobile-push-notifications
-upgrade-or-modify
+upgrade
+modify
 security-model
 authentication-methods
 export-and-import
@@ -20,7 +21,9 @@ upload-backends
 ssl-certificates
 email
 deployment
+multiple-organizations
 email-gateway
 video-calls
 giphy-gif-integration
+scim
 ```

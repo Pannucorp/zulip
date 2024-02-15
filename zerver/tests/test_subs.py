@@ -1,7 +1,8 @@
 import hashlib
 import random
 from datetime import timedelta
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Union
+from io import StringIO
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Union
 from unittest import mock
 
 import orjson
@@ -9,44 +10,55 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.http import HttpResponse
 from django.utils.timezone import now as timezone_now
+from typing_extensions import override
 
-from zerver.lib.actions import (
-    bulk_add_subscriptions,
-    bulk_get_subscriber_user_ids,
-    bulk_remove_subscriptions,
+from zerver.actions.bots import do_change_bot_owner
+from zerver.actions.create_realm import do_create_realm
+from zerver.actions.default_streams import (
     do_add_default_stream,
     do_add_streams_to_default_stream_group,
     do_change_default_stream_group_description,
     do_change_default_stream_group_name,
-    do_change_plan_type,
-    do_change_stream_post_policy,
-    do_change_subscription_property,
-    do_change_user_role,
     do_create_default_stream_group,
-    do_create_realm,
-    do_deactivate_stream,
-    do_deactivate_user,
-    do_get_streams,
     do_remove_default_stream,
     do_remove_default_stream_group,
     do_remove_streams_from_default_stream_group,
-    do_set_realm_property,
-    ensure_stream,
-    gather_subscriptions,
-    gather_subscriptions_helper,
-    get_average_weekly_stream_traffic,
-    get_default_streams_for_realm,
     lookup_default_stream_groups,
-    round_to_2_significant_digits,
-    validate_user_access_to_subscribers_helper,
 )
+from zerver.actions.realm_settings import do_change_realm_plan_type, do_set_realm_property
+from zerver.actions.streams import (
+    bulk_add_subscriptions,
+    bulk_remove_subscriptions,
+    deactivated_streams_by_old_name,
+    do_change_stream_group_based_setting,
+    do_change_stream_permission,
+    do_change_stream_post_policy,
+    do_deactivate_stream,
+    do_unarchive_stream,
+)
+from zerver.actions.user_groups import add_subgroups_to_user_group, check_add_user_group
+from zerver.actions.users import do_change_user_role, do_deactivate_user
+from zerver.lib.attachments import (
+    validate_attachment_request,
+    validate_attachment_request_for_spectator_access,
+)
+from zerver.lib.default_streams import (
+    get_default_stream_ids_for_realm,
+    get_default_streams_for_realm_as_dicts,
+)
+from zerver.lib.email_mirror_helpers import encode_email_address_helper
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.message import aggregate_unread_data, get_raw_unread_data
+from zerver.lib.message import UnreadStreamInfo, aggregate_unread_data, get_raw_unread_data
 from zerver.lib.response import json_success
+from zerver.lib.stream_color import STREAM_ASSIGNMENT_COLORS, pick_colors
 from zerver.lib.stream_subscription import (
     get_active_subscriptions_for_stream_id,
     num_subscribers_for_stream_id,
     subscriber_ids_with_stream_history_access,
+)
+from zerver.lib.stream_traffic import (
+    get_average_weekly_stream_traffic,
+    round_to_2_significant_digits,
 )
 from zerver.lib.streams import (
     StreamDict,
@@ -56,39 +68,137 @@ from zerver.lib.streams import (
     can_access_stream_user_ids,
     create_stream_if_needed,
     create_streams_if_needed,
+    do_get_streams,
+    ensure_stream,
     filter_stream_authorization,
     list_to_streams,
 )
-from zerver.lib.test_classes import ZulipTestCase
+from zerver.lib.subscription_info import (
+    bulk_get_subscriber_user_ids,
+    gather_subscriptions,
+    gather_subscriptions_helper,
+    validate_user_access_to_subscribers_helper,
+)
+from zerver.lib.test_classes import ZulipTestCase, get_topic_messages
 from zerver.lib.test_helpers import (
+    HostRequestMock,
     cache_tries_captured,
     get_subscription,
+    most_recent_message,
     most_recent_usermessage,
     queries_captured,
-    reset_emails_in_zulip_realm,
+    reset_email_visibility_to_everyone_in_zulip_realm,
+)
+from zerver.lib.types import (
+    APIStreamDict,
+    APISubscriptionDict,
+    NeverSubscribedStreamDict,
+    SubscriptionInfo,
 )
 from zerver.models import (
+    Attachment,
     DefaultStream,
     DefaultStreamGroup,
     Message,
     Realm,
+    RealmAuditLog,
     Recipient,
     Stream,
     Subscription,
+    UserGroup,
     UserMessage,
     UserProfile,
-    active_non_guest_user_ids,
-    flush_per_request_caches,
-    get_default_stream_groups,
-    get_realm,
-    get_stream,
-    get_user,
-    get_user_profile_by_id_in_realm,
 )
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_default_stream_groups, get_stream
+from zerver.models.users import active_non_guest_user_ids, get_user, get_user_profile_by_id_in_realm
 from zerver.views.streams import compose_views
+
+if TYPE_CHECKING:
+    from django.test.client import _MonkeyPatchedWSGIResponse as TestHttpResponse
 
 
 class TestMiscStuff(ZulipTestCase):
+    def test_test_helper(self) -> None:
+        cordelia = self.example_user("cordelia")
+        s = self.subscribed_stream_name_list(cordelia)
+        self.assertIn("* Verona", s)
+        self.assertNotIn("* Denmark", s)
+
+    def test_pick_colors(self) -> None:
+        used_colors: Set[str] = set()
+        color_map: Dict[int, str] = {}
+        recipient_ids = list(range(30))
+        user_color_map = pick_colors(used_colors, color_map, recipient_ids)
+        self.assertEqual(
+            user_color_map,
+            {
+                0: "#76ce90",
+                1: "#fae589",
+                2: "#a6c7e5",
+                3: "#e79ab5",
+                4: "#bfd56f",
+                5: "#f4ae55",
+                6: "#b0a5fd",
+                7: "#addfe5",
+                8: "#f5ce6e",
+                9: "#c2726a",
+                10: "#94c849",
+                11: "#bd86e5",
+                12: "#ee7e4a",
+                13: "#a6dcbf",
+                14: "#95a5fd",
+                15: "#53a063",
+                16: "#9987e1",
+                17: "#e4523d",
+                18: "#c2c2c2",
+                19: "#4f8de4",
+                20: "#c6a8ad",
+                21: "#e7cc4d",
+                22: "#c8bebf",
+                23: "#a47462",
+                # start repeating
+                24: "#76ce90",
+                25: "#fae589",
+                26: "#a6c7e5",
+                27: "#e79ab5",
+                28: "#bfd56f",
+                29: "#f4ae55",
+            },
+        )
+
+        color_map = {98: "color98", 99: "color99"}
+        used_colors = set(STREAM_ASSIGNMENT_COLORS) - {"#c6a8ad", "#9987e1"}
+        recipient_ids = [99, 98, 1, 2, 3, 4]
+        user_color_map = pick_colors(used_colors, color_map, recipient_ids)
+        self.assertEqual(
+            user_color_map,
+            {98: "color98", 99: "color99", 1: "#9987e1", 2: "#c6a8ad", 3: "#e79ab5", 4: "#bfd56f"},
+        )
+
+        """
+        If we are assigning colors to a user with 24+ streams, we have to start
+        re-using old colors.  Our algorithm basically uses recipient_id % 24, so
+        the following code reflects the worse case scenario that our new
+        streams have recipient ids spaced out by exact multiples of 24.  We
+        don't try to work around this edge case, since users who really depend
+        on the stream colors can always just assign themselves custom colors
+        for the streams that they really want to stand out.
+
+        Even if recipient_ids were completely random, the odds of collisions
+        are low, but it's often the case that bulk-adds are done for streams
+        that either were or are being created at roughly the same time, so the
+        recipient_ids tend to have even fewer collisions.
+        """
+        used_colors = set(STREAM_ASSIGNMENT_COLORS)
+        color_map = {}
+        recipient_ids = [2, 26, 50, 74]
+        user_color_map = pick_colors(used_colors, color_map, recipient_ids)
+        self.assertEqual(
+            user_color_map,
+            {2: "#a6c7e5", 26: "#a6c7e5", 50: "#a6c7e5", 74: "#a6c7e5"},
+        )
+
     def test_empty_results(self) -> None:
         # These are essentially just tests to ensure line
         # coverage for codepaths that won't ever really be
@@ -112,6 +222,31 @@ class TestMiscStuff(ZulipTestCase):
         )
         self.assertEqual(streams, [])
 
+    def test_api_fields(self) -> None:
+        """Verify that all the fields from `Stream.API_FIELDS` and `Subscription.API_FIELDS` present
+        in `APIStreamDict` and `APISubscriptionDict`, respectively.
+        """
+        expected_fields = set(Stream.API_FIELDS) | {"stream_id"}
+        expected_fields -= {"id", "can_remove_subscribers_group_id"}
+        expected_fields |= {"can_remove_subscribers_group"}
+
+        stream_dict_fields = set(APIStreamDict.__annotations__.keys())
+        computed_fields = {"is_announcement_only", "is_default", "stream_weekly_traffic"}
+
+        self.assertEqual(stream_dict_fields - computed_fields, expected_fields)
+
+        expected_fields = set(Subscription.API_FIELDS)
+
+        subscription_dict_fields = set(APISubscriptionDict.__annotations__.keys())
+        computed_fields = {"in_home_view", "email_address", "stream_weekly_traffic", "subscribers"}
+        # `APISubscriptionDict` is a subclass of `APIStreamDict`, therefore having all the
+        # fields in addition to the computed fields and `Subscription.API_FIELDS` that
+        # need to be excluded here.
+        self.assertEqual(
+            subscription_dict_fields - computed_fields - stream_dict_fields,
+            expected_fields,
+        )
+
 
 class TestCreateStreams(ZulipTestCase):
     def test_creating_streams(self) -> None:
@@ -120,8 +255,7 @@ class TestCreateStreams(ZulipTestCase):
         realm = get_realm("zulip")
 
         # Test stream creation events.
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             ensure_stream(realm, "Public stream", invite_only=False, acting_user=None)
 
         self.assertEqual(events[0]["event"]["type"], "stream")
@@ -129,8 +263,9 @@ class TestCreateStreams(ZulipTestCase):
         # Send public stream creation event to all active users.
         self.assertEqual(events[0]["users"], active_non_guest_user_ids(realm.id))
         self.assertEqual(events[0]["event"]["streams"][0]["name"], "Public stream")
+        self.assertEqual(events[0]["event"]["streams"][0]["stream_weekly_traffic"], None)
 
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             ensure_stream(realm, "Private stream", invite_only=True, acting_user=None)
 
         self.assertEqual(events[0]["event"]["type"], "stream")
@@ -140,7 +275,11 @@ class TestCreateStreams(ZulipTestCase):
         self.assertTrue(self.example_user("iago").id in events[0]["users"])
         self.assertTrue(self.example_user("desdemona").id in events[0]["users"])
         self.assertEqual(events[0]["event"]["streams"][0]["name"], "Private stream")
+        self.assertEqual(events[0]["event"]["streams"][0]["stream_weekly_traffic"], None)
 
+        moderators_system_group = UserGroup.objects.get(
+            name="role:moderators", realm=realm, is_system_group=True
+        )
         new_streams, existing_streams = create_streams_if_needed(
             realm,
             [
@@ -150,6 +289,7 @@ class TestCreateStreams(ZulipTestCase):
                     "invite_only": True,
                     "stream_post_policy": Stream.STREAM_POST_POLICY_ADMINS,
                     "message_retention_days": -1,
+                    "can_remove_subscribers_group": moderators_system_group,
                 }
                 for (stream_name, stream_description) in zip(stream_names, stream_descriptions)
             ],
@@ -166,6 +306,7 @@ class TestCreateStreams(ZulipTestCase):
             self.assertTrue(stream.invite_only)
             self.assertTrue(stream.stream_post_policy == Stream.STREAM_POST_POLICY_ADMINS)
             self.assertTrue(stream.message_retention_days == -1)
+            self.assertEqual(stream.can_remove_subscribers_group.id, moderators_system_group.id)
 
         new_streams, existing_streams = create_streams_if_needed(
             realm,
@@ -207,7 +348,7 @@ class TestCreateStreams(ZulipTestCase):
                 "name": "publicstream",
                 "description": "Public stream with public history",
             },
-            {"name": "webpublicstream", "description": "Web public stream", "is_web_public": True},
+            {"name": "webpublicstream", "description": "Web-public stream", "is_web_public": True},
             {
                 "name": "privatestream",
                 "description": "Private stream with non-public history",
@@ -243,6 +384,47 @@ class TestCreateStreams(ZulipTestCase):
             if stream.name == "publictrywithouthistory":
                 self.assertTrue(stream.history_public_to_subscribers)
 
+    def test_add_stream_as_default_on_stream_creation(self) -> None:
+        user_profile = self.example_user("hamlet")
+        self.login_user(user_profile)
+        realm = user_profile.realm
+
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [{"name": "default_stream", "description": "This stream is default for new users"}]
+            ).decode(),
+            "is_default_stream": orjson.dumps(True).decode(),
+        }
+        result = self.api_post(
+            user_profile, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip"
+        )
+        self.assert_json_error(result, "Insufficient permission")
+
+        do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
+        result = self.api_post(
+            user_profile, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip"
+        )
+        self.assert_json_success(result)
+        default_stream = get_stream("default_stream", realm)
+        self.assertTrue(default_stream.id in get_default_stream_ids_for_realm(realm.id))
+
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [
+                    {
+                        "name": "private_default_stream",
+                        "description": "This stream is private and default for new users",
+                    }
+                ]
+            ).decode(),
+            "invite_only": orjson.dumps(True).decode(),
+            "is_default_stream": orjson.dumps(True).decode(),
+        }
+        result = self.api_post(
+            user_profile, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip"
+        )
+        self.assert_json_error(result, "A default stream cannot be private.")
+
     def test_history_public_to_subscribers_zephyr_realm(self) -> None:
         realm = get_realm("zephyr")
 
@@ -259,7 +441,7 @@ class TestCreateStreams(ZulipTestCase):
     def test_auto_mark_stream_created_message_as_read_for_stream_creator(self) -> None:
         # This test relies on email == delivery_email for
         # convenience.
-        reset_emails_in_zulip_realm()
+        reset_email_visibility_to_everyone_in_zulip_realm()
 
         realm = Realm.objects.get(name="Zulip Dev")
         iago = self.example_user("iago")
@@ -319,7 +501,7 @@ class TestCreateStreams(ZulipTestCase):
             final_usermessage_count - initial_usermessage_count, 4 + announce_stream_subs.count()
         )
 
-        def get_unread_stream_data(user: UserProfile) -> List[Dict[str, Any]]:
+        def get_unread_stream_data(user: UserProfile) -> List[UnreadStreamInfo]:
             raw_unread_data = get_raw_unread_data(user)
             aggregated_data = aggregate_unread_data(raw_unread_data)
             return aggregated_data["streams"]
@@ -338,6 +520,91 @@ class TestCreateStreams(ZulipTestCase):
         # But it should be marked as read for Iago, the stream creator.
         self.assert_length(iago_unread_messages, 0)
 
+    def test_can_remove_subscribers_group_on_stream_creation(self) -> None:
+        user = self.example_user("hamlet")
+        realm = user.realm
+        self.login_user(user)
+        moderators_system_group = UserGroup.objects.get(
+            name="role:moderators", realm=realm, is_system_group=True
+        )
+        admins_system_group = UserGroup.objects.get(
+            name="role:administrators", realm=realm, is_system_group=True
+        )
+
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new_stream1", "description": "First new stream"}]
+            ).decode(),
+            "can_remove_subscribers_group": orjson.dumps(moderators_system_group.id).decode(),
+        }
+        result = self.api_post(user, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip")
+        self.assert_json_success(result)
+        stream = get_stream("new_stream1", realm)
+        self.assertEqual(stream.can_remove_subscribers_group.id, moderators_system_group.id)
+
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new_stream2", "description": "Second new stream"}]
+            ).decode(),
+        }
+        result = self.api_post(user, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip")
+        self.assert_json_success(result)
+        stream = get_stream("new_stream2", realm)
+        self.assertEqual(stream.can_remove_subscribers_group.id, admins_system_group.id)
+
+        hamletcharacters_group = UserGroup.objects.get(name="hamletcharacters", realm=realm)
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new_stream3", "description": "Third new stream"}]
+            ).decode(),
+            "can_remove_subscribers_group": orjson.dumps(hamletcharacters_group.id).decode(),
+        }
+        result = self.api_post(user, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip")
+        self.assert_json_error(
+            result, "'can_remove_subscribers_group' must be a system user group."
+        )
+
+        internet_group = UserGroup.objects.get(
+            name="role:internet", is_system_group=True, realm=realm
+        )
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new_stream3", "description": "Third new stream"}]
+            ).decode(),
+            "can_remove_subscribers_group": orjson.dumps(internet_group.id).decode(),
+        }
+        result = self.api_post(user, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip")
+        self.assert_json_error(
+            result,
+            "'can_remove_subscribers_group' setting cannot be set to 'role:internet' group.",
+        )
+
+        owners_group = UserGroup.objects.get(name="role:owners", is_system_group=True, realm=realm)
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new_stream3", "description": "Third new stream"}]
+            ).decode(),
+            "can_remove_subscribers_group": orjson.dumps(owners_group.id).decode(),
+        }
+        result = self.api_post(user, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip")
+        self.assert_json_error(
+            result,
+            "'can_remove_subscribers_group' setting cannot be set to 'role:owners' group.",
+        )
+
+        nobody_group = UserGroup.objects.get(name="role:nobody", is_system_group=True, realm=realm)
+        post_data = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new_stream3", "description": "Third new stream"}]
+            ).decode(),
+            "can_remove_subscribers_group": orjson.dumps(nobody_group.id).decode(),
+        }
+        result = self.api_post(user, "/api/v1/users/me/subscriptions", post_data, subdomain="zulip")
+        self.assert_json_error(
+            result,
+            "'can_remove_subscribers_group' setting cannot be set to 'role:nobody' group.",
+        )
+
 
 class RecipientTest(ZulipTestCase):
     def test_recipient(self) -> None:
@@ -347,7 +614,7 @@ class RecipientTest(ZulipTestCase):
             type_id=stream.id,
             type=Recipient.STREAM,
         )
-        self.assertEqual(str(recipient), f"<Recipient: Verona ({stream.id}, {Recipient.STREAM})>")
+        self.assertEqual(repr(recipient), f"<Recipient: Verona ({stream.id}, {Recipient.STREAM})>")
 
 
 class StreamAdminTest(ZulipTestCase):
@@ -359,19 +626,17 @@ class StreamAdminTest(ZulipTestCase):
 
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("private_stream_1").decode(),
             "is_private": orjson.dumps(False).decode(),
         }
         stream_id = get_stream("private_stream_1", user_profile.realm).id
         result = self.client_patch(f"/json/streams/{stream_id}", params)
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         stream = self.subscribe(user_profile, "private_stream_1")
         self.assertFalse(stream.is_in_zephyr_realm)
 
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("private_stream_1").decode(),
             "is_private": orjson.dumps(False).decode(),
         }
         result = self.client_patch(f"/json/streams/{stream_id}", params)
@@ -382,31 +647,48 @@ class StreamAdminTest(ZulipTestCase):
         self.assertFalse(stream.invite_only)
         self.assertTrue(stream.history_public_to_subscribers)
 
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**King Hamlet|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Private, protected history** to **Public**."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+
+        history_public_to_subscribers_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert history_public_to_subscribers_log is not None
+
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: False,
+            RealmAuditLog.NEW_VALUE: True,
+            "property": "history_public_to_subscribers",
+        }
+        self.assertEqual(history_public_to_subscribers_log.extra_data, expected_extra_data)
+
+        invite_only_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).order_by("-id")[1]
+        assert invite_only_log is not None
+
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: True,
+            RealmAuditLog.NEW_VALUE: False,
+            "property": "invite_only",
+        }
+        self.assertEqual(invite_only_log.extra_data, expected_extra_data)
+
         do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("private_stream_2").decode(),
             "is_private": orjson.dumps(False).decode(),
         }
         stream = self.subscribe(user_profile, "private_stream_2")
         result = self.client_patch(f"/json/streams/{stream.id}", params)
         self.assertTrue(stream.invite_only)
-        self.assert_json_error(result, "Must be an organization or stream administrator")
-
-        sub = get_subscription("private_stream_2", user_profile)
-        do_change_subscription_property(
-            user_profile,
-            sub,
-            stream,
-            "role",
-            Subscription.ROLE_STREAM_ADMINISTRATOR,
-            acting_user=None,
-        )
-        result = self.client_patch(f"/json/streams/{stream.id}", params)
-        self.assert_json_success(result)
-
-        stream = get_stream("private_stream_2", realm)
-        self.assertFalse(stream.invite_only)
-        self.assertTrue(stream.history_public_to_subscribers)
+        self.assert_json_error(result, "Must be an organization administrator")
 
     def test_make_stream_private(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -417,51 +699,66 @@ class StreamAdminTest(ZulipTestCase):
 
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("public_stream_1").decode(),
             "is_private": orjson.dumps(True).decode(),
         }
-        stream_id = get_stream("public_stream_1", realm).id
+        stream_id = self.subscribe(user_profile, "public_stream_1").id
         result = self.client_patch(f"/json/streams/{stream_id}", params)
         self.assert_json_success(result)
         stream = get_stream("public_stream_1", realm)
         self.assertTrue(stream.invite_only)
         self.assertFalse(stream.history_public_to_subscribers)
 
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**King Hamlet|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Public** to **Private, protected history**."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+
+        history_public_to_subscribers_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert history_public_to_subscribers_log is not None
+
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: True,
+            RealmAuditLog.NEW_VALUE: False,
+            "property": "history_public_to_subscribers",
+        }
+        self.assertEqual(history_public_to_subscribers_log.extra_data, expected_extra_data)
+
+        invite_only_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).order_by("-id")[1]
+        assert invite_only_log is not None
+
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: False,
+            RealmAuditLog.NEW_VALUE: True,
+            "property": "invite_only",
+        }
+        self.assertEqual(invite_only_log.extra_data, expected_extra_data)
+
         default_stream = self.make_stream("default_stream", realm=realm)
         do_add_default_stream(default_stream)
         params = {
-            "stream_name": orjson.dumps("default_stream").decode(),
             "is_private": orjson.dumps(True).decode(),
         }
         result = self.client_patch(f"/json/streams/{default_stream.id}", params)
-        self.assert_json_error(result, "Default streams cannot be made private.")
+        self.assert_json_error(result, "A default stream cannot be private.")
         self.assertFalse(default_stream.invite_only)
 
         do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("public_stream_2").decode(),
             "is_private": orjson.dumps(True).decode(),
         }
         stream = self.subscribe(user_profile, "public_stream_2")
         result = self.client_patch(f"/json/streams/{stream.id}", params)
         self.assertFalse(stream.invite_only)
-        self.assert_json_error(result, "Must be an organization or stream administrator")
-
-        sub = get_subscription("public_stream_2", user_profile)
-        do_change_subscription_property(
-            user_profile,
-            sub,
-            stream,
-            "role",
-            Subscription.ROLE_STREAM_ADMINISTRATOR,
-            acting_user=None,
-        )
-        result = self.client_patch(f"/json/streams/{stream.id}", params)
-        self.assert_json_success(result)
-
-        stream = get_stream("public_stream_2", realm)
-        self.assertTrue(stream.invite_only)
-        self.assertFalse(stream.history_public_to_subscribers)
+        self.assert_json_error(result, "Must be an organization administrator")
 
     def test_create_web_public_stream(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -487,7 +784,7 @@ class StreamAdminTest(ZulipTestCase):
         with self.settings(WEB_PUBLIC_STREAMS_ENABLED=False):
             self.assertFalse(user_profile.can_create_web_public_streams())
             self.assertFalse(owner.can_create_web_public_streams())
-            with self.assertRaisesRegex(JsonableError, "Web public streams are not enabled."):
+            with self.assertRaisesRegex(JsonableError, "Web-public streams are not enabled."):
                 list_to_streams(
                     streams_raw,
                     owner,
@@ -519,7 +816,6 @@ class StreamAdminTest(ZulipTestCase):
 
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("target_stream").decode(),
             "is_private": orjson.dumps(False).decode(),
         }
         stream_id = get_stream("target_stream", realm).id
@@ -529,7 +825,28 @@ class StreamAdminTest(ZulipTestCase):
         self.assertFalse(stream.invite_only)
         self.assertFalse(stream.history_public_to_subscribers)
 
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**{user_profile.full_name}|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Private, protected history** to **Public, protected history**."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: True,
+            RealmAuditLog.NEW_VALUE: False,
+            "property": "invite_only",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
     def test_make_stream_private_with_public_history(self) -> None:
+        # Convert a public stream to a private stream with shared history
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
         realm = user_profile.realm
@@ -537,43 +854,112 @@ class StreamAdminTest(ZulipTestCase):
 
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("public_history_stream").decode(),
             "is_private": orjson.dumps(True).decode(),
             "history_public_to_subscribers": orjson.dumps(True).decode(),
         }
-        stream_id = get_stream("public_history_stream", realm).id
+        stream_id = self.subscribe(user_profile, "public_history_stream").id
         result = self.client_patch(f"/json/streams/{stream_id}", params)
         self.assert_json_success(result)
         stream = get_stream("public_history_stream", realm)
         self.assertTrue(stream.invite_only)
         self.assertTrue(stream.history_public_to_subscribers)
 
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**King Hamlet|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Public** to **Private, shared history**."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: False,
+            RealmAuditLog.NEW_VALUE: True,
+            "property": "invite_only",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
+        # Convert a private stream with protected history to a private stream
+        # with shared history.
+        self.make_stream(
+            "private_protected_stream",
+            realm=realm,
+            invite_only=True,
+            history_public_to_subscribers=False,
+        )
+        params = {
+            "is_private": orjson.dumps(True).decode(),
+            "history_public_to_subscribers": orjson.dumps(True).decode(),
+        }
+        stream_id = self.subscribe(user_profile, "private_protected_stream").id
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_success(result)
+        stream = get_stream("private_protected_stream", realm)
+        self.assertTrue(stream.invite_only)
+        self.assertTrue(stream.history_public_to_subscribers)
+
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**King Hamlet|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Private, protected history** to **Private, shared history**."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: False,
+            RealmAuditLog.NEW_VALUE: True,
+            "property": "history_public_to_subscribers",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
     def test_make_stream_web_public(self) -> None:
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
         realm = user_profile.realm
         self.make_stream("test_stream", realm=realm)
-        stream_id = get_stream("test_stream", realm).id
+        stream_id = self.subscribe(user_profile, "test_stream").id
 
         params = {
-            "stream_name": orjson.dumps("test_stream").decode(),
             "is_web_public": orjson.dumps(True).decode(),
             "history_public_to_subscribers": orjson.dumps(True).decode(),
         }
         result = self.client_patch(f"/json/streams/{stream_id}", params)
-        self.assert_json_error(result, "Must be an organization or stream administrator")
+        self.assert_json_error(result, "Must be an organization administrator")
 
+        do_set_realm_property(
+            realm, "create_web_public_stream_policy", Realm.POLICY_OWNERS_ONLY, acting_user=None
+        )
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         result = self.client_patch(f"/json/streams/{stream_id}", params)
-        self.assert_json_error(result, "Must be an organization owner")
+        self.assert_json_error(result, "Insufficient permission")
 
+        do_set_realm_property(
+            realm, "create_web_public_stream_policy", Realm.POLICY_NOBODY, acting_user=None
+        )
+        do_change_user_role(user_profile, UserProfile.ROLE_REALM_OWNER, acting_user=None)
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_error(result, "Insufficient permission")
+
+        do_set_realm_property(
+            realm, "create_web_public_stream_policy", Realm.POLICY_OWNERS_ONLY, acting_user=None
+        )
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_OWNER, acting_user=None)
         with self.settings(WEB_PUBLIC_STREAMS_ENABLED=False):
             result = self.client_patch(f"/json/streams/{stream_id}", params)
-        self.assert_json_error(result, "Web public streams are not enabled.")
+        self.assert_json_error(result, "Web-public streams are not enabled.")
 
         bad_params = {
-            "stream_name": orjson.dumps("test_stream").decode(),
             "is_web_public": orjson.dumps(True).decode(),
             "is_private": orjson.dumps(True).decode(),
             "history_public_to_subscribers": orjson.dumps(True).decode(),
@@ -582,7 +968,6 @@ class StreamAdminTest(ZulipTestCase):
         self.assert_json_error(result, "Invalid parameters")
 
         bad_params = {
-            "stream_name": orjson.dumps("test_stream").decode(),
             "is_web_public": orjson.dumps(True).decode(),
             "is_private": orjson.dumps(False).decode(),
             "history_public_to_subscribers": orjson.dumps(False).decode(),
@@ -601,7 +986,307 @@ class StreamAdminTest(ZulipTestCase):
         self.assertFalse(stream.invite_only)
         self.assertTrue(stream.history_public_to_subscribers)
 
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**King Hamlet|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Public** to **Web-public**."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: False,
+            RealmAuditLog.NEW_VALUE: True,
+            "property": "is_web_public",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
+    def test_change_history_access_for_private_streams(self) -> None:
+        user_profile = self.example_user("iago")
+        self.login_user(user_profile)
+        realm = user_profile.realm
+        self.make_stream("private_stream", realm=realm, invite_only=True)
+        stream_id = self.subscribe(user_profile, "private_stream").id
+
+        params = {
+            "history_public_to_subscribers": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_success(result)
+
+        stream = get_stream("private_stream", realm)
+        self.assertTrue(stream.invite_only)
+        self.assertTrue(stream.history_public_to_subscribers)
+
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**Iago|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Private, protected history** to **Private, shared history**."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: False,
+            RealmAuditLog.NEW_VALUE: True,
+            "property": "history_public_to_subscribers",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
+        params = {
+            "history_public_to_subscribers": orjson.dumps(False).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_success(result)
+
+        stream = get_stream("private_stream", realm)
+        self.assertTrue(stream.invite_only)
+        self.assertFalse(stream.history_public_to_subscribers)
+
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 2)
+        expected_notification = (
+            f"@_**Iago|{user_profile.id}** changed the [access permissions](/help/stream-permissions) "
+            "for this stream from **Private, shared history** to **Private, protected history**."
+        )
+        self.assertEqual(messages[1].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: True,
+            RealmAuditLog.NEW_VALUE: False,
+            "property": "history_public_to_subscribers",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
+    def test_add_and_remove_stream_as_default(self) -> None:
+        user_profile = self.example_user("hamlet")
+        self.login_user(user_profile)
+        realm = user_profile.realm
+        stream = self.make_stream("stream", realm=realm)
+        stream_id = self.subscribe(user_profile, "stream").id
+
+        params = {
+            "is_default_stream": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_error(result, "Must be an organization administrator")
+        self.assertFalse(stream_id in get_default_stream_ids_for_realm(realm.id))
+
+        do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_success(result)
+        self.assertTrue(stream_id in get_default_stream_ids_for_realm(realm.id))
+
+        params = {
+            "is_private": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_error(result, "A default stream cannot be private.")
+        stream.refresh_from_db()
+        self.assertFalse(stream.invite_only)
+
+        params = {
+            "is_private": orjson.dumps(True).decode(),
+            "is_default_stream": orjson.dumps(False).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_success(result)
+        stream.refresh_from_db()
+        self.assertTrue(stream.invite_only)
+        self.assertFalse(stream_id in get_default_stream_ids_for_realm(realm.id))
+
+        stream_2 = self.make_stream("stream_2", realm=realm)
+        stream_2_id = self.subscribe(user_profile, "stream_2").id
+
+        bad_params = {
+            "is_default_stream": orjson.dumps(True).decode(),
+            "is_private": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream_2_id}", bad_params)
+        self.assert_json_error(result, "A default stream cannot be private.")
+        stream.refresh_from_db()
+        self.assertFalse(stream_2.invite_only)
+        self.assertFalse(stream_2_id in get_default_stream_ids_for_realm(realm.id))
+
+        private_stream = self.make_stream("private_stream", realm=realm, invite_only=True)
+        private_stream_id = self.subscribe(user_profile, "private_stream").id
+
+        params = {
+            "is_default_stream": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{private_stream_id}", params)
+        self.assert_json_error(result, "A default stream cannot be private.")
+        self.assertFalse(private_stream_id in get_default_stream_ids_for_realm(realm.id))
+
+        params = {
+            "is_private": orjson.dumps(False).decode(),
+            "is_default_stream": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{private_stream_id}", params)
+        self.assert_json_success(result)
+        private_stream.refresh_from_db()
+        self.assertFalse(private_stream.invite_only)
+        self.assertTrue(private_stream_id in get_default_stream_ids_for_realm(realm.id))
+
+    def test_stream_permission_changes_updates_updates_attachments(self) -> None:
+        self.login("desdemona")
+        fp = StringIO("zulip!")
+        fp.name = "zulip.txt"
+
+        result = self.client_post("/json/user_uploads", {"file": fp})
+        url = self.assert_json_success(result)["uri"]
+
+        owner = self.example_user("desdemona")
+        realm = owner.realm
+        stream = self.make_stream("test_stream", realm=realm)
+        self.subscribe(owner, "test_stream")
+        body = f"First message ...[zulip.txt](http://{realm.host}" + url + ")"
+        msg_id = self.send_stream_message(owner, "test_stream", body, "test")
+        attachment = Attachment.objects.get(messages__id=msg_id)
+
+        self.assertFalse(stream.is_web_public)
+        self.assertFalse(attachment.is_web_public)
+        self.assertFalse(stream.invite_only)
+        self.assertTrue(attachment.is_realm_public)
+
+        params = {
+            "is_private": orjson.dumps(True).decode(),
+            "history_public_to_subscribers": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream.id}", params)
+        self.assert_json_success(result)
+
+        attachment.refresh_from_db()
+        stream.refresh_from_db()
+        self.assertFalse(stream.is_web_public)
+        self.assertFalse(attachment.is_web_public)
+        self.assertTrue(stream.invite_only)
+        self.assertIsNone(attachment.is_realm_public)
+
+        cordelia = self.example_user("cordelia")
+        self.assertFalse(validate_attachment_request(cordelia, attachment.path_id))
+        self.assertTrue(validate_attachment_request(owner, attachment.path_id))
+        attachment.refresh_from_db()
+        self.assertFalse(attachment.is_realm_public)
+        self.assertFalse(validate_attachment_request_for_spectator_access(realm, attachment))
+
+        params = {
+            "is_private": orjson.dumps(False).decode(),
+            "is_web_public": orjson.dumps(True).decode(),
+            "history_public_to_subscribers": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream.id}", params)
+        self.assert_json_success(result)
+
+        attachment.refresh_from_db()
+        stream.refresh_from_db()
+        self.assertFalse(stream.invite_only)
+        self.assertTrue(stream.is_web_public)
+        self.assertIsNone(attachment.is_realm_public)
+        self.assertIsNone(attachment.is_web_public)
+
+        self.assertTrue(validate_attachment_request_for_spectator_access(realm, attachment))
+        attachment.refresh_from_db()
+        self.assertTrue(attachment.is_web_public)
+        self.assertIsNone(attachment.is_realm_public)
+
+        self.assertTrue(validate_attachment_request(cordelia, attachment.path_id))
+        attachment.refresh_from_db()
+        self.assertTrue(attachment.is_realm_public)
+
+        params = {
+            "is_private": orjson.dumps(False).decode(),
+            "is_web_public": orjson.dumps(False).decode(),
+            "history_public_to_subscribers": orjson.dumps(True).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream.id}", params)
+        self.assert_json_success(result)
+
+        attachment.refresh_from_db()
+        stream.refresh_from_db()
+        self.assertIsNone(attachment.is_web_public)
+        self.assertFalse(stream.invite_only)
+        self.assertTrue(attachment.is_realm_public)
+
+        self.assertFalse(validate_attachment_request_for_spectator_access(realm, attachment))
+        attachment.refresh_from_db()
+        stream.refresh_from_db()
+        self.assertFalse(attachment.is_web_public)
+
+        # Verify moving a message to another public stream doesn't reset cache.
+        new_stream = self.make_stream("new_stream", realm=realm)
+        self.subscribe(owner, "new_stream")
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "stream_id": new_stream.id,
+                "propagate_mode": "change_all",
+            },
+        )
+        self.assert_json_success(result)
+        attachment.refresh_from_db()
+        self.assertFalse(attachment.is_web_public)
+        self.assertTrue(attachment.is_realm_public)
+
+        # Verify moving a message to a private stream
+        private_stream = self.make_stream("private_stream", realm=realm, invite_only=True)
+        self.subscribe(owner, "private_stream")
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "stream_id": private_stream.id,
+                "propagate_mode": "change_all",
+            },
+        )
+        self.assert_json_success(result)
+        attachment.refresh_from_db()
+        self.assertFalse(attachment.is_web_public)
+        self.assertIsNone(attachment.is_realm_public)
+
+        self.assertFalse(validate_attachment_request(cordelia, attachment.path_id))
+        self.assertTrue(validate_attachment_request(owner, attachment.path_id))
+        attachment.refresh_from_db()
+        self.assertFalse(attachment.is_realm_public)
+
+        # Verify moving a message to a web-public stream
+        web_public_stream = self.make_stream("web_public_stream", realm=realm, is_web_public=True)
+        result = self.client_patch(
+            "/json/messages/" + str(msg_id),
+            {
+                "stream_id": web_public_stream.id,
+                "propagate_mode": "change_all",
+            },
+        )
+        self.assert_json_success(result)
+        attachment.refresh_from_db()
+        self.assertIsNone(attachment.is_web_public)
+        self.assertIsNone(attachment.is_realm_public)
+
+        self.assertTrue(validate_attachment_request_for_spectator_access(realm, attachment))
+        attachment.refresh_from_db()
+        self.assertTrue(attachment.is_web_public)
+
     def test_try_make_stream_public_with_private_history(self) -> None:
+        # We only support public streams with private history if
+        # is_zephyr_mirror_realm, and don't allow changing stream
+        # permissions in such realms.  So changing the
+        # history_public_to_subscribers property of a public stream is
+        # not possible in Zulip today
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
         realm = user_profile.realm
@@ -609,16 +1294,22 @@ class StreamAdminTest(ZulipTestCase):
 
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         params = {
-            "stream_name": orjson.dumps("public_stream").decode(),
             "is_private": orjson.dumps(False).decode(),
             "history_public_to_subscribers": orjson.dumps(False).decode(),
         }
-        stream_id = get_stream("public_stream", realm).id
+        stream_id = self.subscribe(user_profile, "public_stream").id
         result = self.client_patch(f"/json/streams/{stream_id}", params)
-        self.assert_json_success(result)
-        stream = get_stream("public_stream", realm)
-        self.assertFalse(stream.invite_only)
-        self.assertTrue(stream.history_public_to_subscribers)
+        self.assert_json_error(result, "Invalid parameters")
+
+        params = {
+            "history_public_to_subscribers": orjson.dumps(False).decode(),
+        }
+        result = self.client_patch(f"/json/streams/{stream_id}", params)
+        self.assert_json_error(result, "Invalid parameters")
+
+        web_public_stream = self.make_stream("web_public_stream", realm=realm, is_web_public=True)
+        result = self.client_patch(f"/json/streams/{web_public_stream.id}", params)
+        self.assert_json_error(result, "Invalid parameters")
 
     def test_subscriber_ids_with_stream_history_access(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -681,30 +1372,6 @@ class StreamAdminTest(ZulipTestCase):
         )
         self.assertFalse(subscription_exists)
 
-        do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=None)
-        stream = self.make_stream("new_stream_2")
-        self.subscribe(user_profile, stream.name)
-        sub = get_subscription(stream.name, user_profile)
-        do_change_subscription_property(
-            user_profile,
-            sub,
-            stream,
-            "role",
-            Subscription.ROLE_STREAM_ADMINISTRATOR,
-            acting_user=None,
-        )
-
-        result = self.client_delete(f"/json/streams/{stream.id}")
-        self.assert_json_success(result)
-        subscription_exists = (
-            get_active_subscriptions_for_stream_id(stream.id, include_deactivated_users=True)
-            .filter(
-                user_profile=user_profile,
-            )
-            .exists()
-        )
-        self.assertFalse(subscription_exists)
-
     def test_deactivate_stream_removes_default_stream(self) -> None:
         stream = self.make_stream("new_stream")
         do_add_default_stream(stream)
@@ -714,15 +1381,11 @@ class StreamAdminTest(ZulipTestCase):
 
     def test_deactivate_stream_removes_stream_from_default_stream_groups(self) -> None:
         realm = get_realm("zulip")
-        streams_to_keep = []
-        for stream_name in ["stream1", "stream2"]:
-            stream = ensure_stream(realm, stream_name, acting_user=None)
-            streams_to_keep.append(stream)
-
-        streams_to_remove = []
-        stream = ensure_stream(realm, "stream3", acting_user=None)
-        streams_to_remove.append(stream)
-
+        streams_to_keep = [
+            ensure_stream(realm, stream_name, acting_user=None)
+            for stream_name in ["stream1", "stream2"]
+        ]
+        streams_to_remove = [ensure_stream(realm, "stream3", acting_user=None)]
         all_streams = streams_to_keep + streams_to_remove
 
         def get_streams(group: DefaultStreamGroup) -> List[Stream]:
@@ -757,11 +1420,101 @@ class StreamAdminTest(ZulipTestCase):
         self.assertFalse(new_stream_usermessage.flags.read)
         self.assertFalse(denmark_usermessage.flags.read)
 
-        do_deactivate_stream(stream, acting_user=None)
+        with self.captureOnCommitCallbacks(execute=True):
+            do_deactivate_stream(stream, acting_user=None)
         new_stream_usermessage.refresh_from_db()
         denmark_usermessage.refresh_from_db()
         self.assertTrue(new_stream_usermessage.flags.read)
         self.assertFalse(denmark_usermessage.flags.read)
+
+    def test_deactivated_streams_by_old_name(self) -> None:
+        realm = get_realm("zulip")
+        stream = self.make_stream("new_stream")
+        do_deactivate_stream(stream, acting_user=None)
+        self.assertEqual(set(deactivated_streams_by_old_name(realm, "new_stream")), {stream})
+
+        second_stream = self.make_stream("new_stream")
+        do_deactivate_stream(second_stream, acting_user=None)
+        self.assertEqual(
+            set(deactivated_streams_by_old_name(realm, "new_stream")), {stream, second_stream}
+        )
+
+        self.make_stream("!DEACTIVATED:old_style")  # This is left active
+        old_style = self.make_stream("old_style")
+        do_deactivate_stream(old_style, acting_user=None)
+        old_style.name = "!!DEACTIVATED:old_style"
+        old_style.save()
+        self.assertEqual(set(deactivated_streams_by_old_name(realm, "old_style")), {old_style})
+
+    def test_unarchive_stream_active_stream(self) -> None:
+        stream = self.make_stream("new_stream")
+        with self.assertRaisesRegex(JsonableError, "Stream is not currently deactivated"):
+            do_unarchive_stream(stream, new_name="new_stream", acting_user=None)
+
+    def test_unarchive_stream_existing_name(self) -> None:
+        stream = self.make_stream("new_stream")
+        self.make_stream("existing")
+        do_deactivate_stream(stream, acting_user=None)
+        with self.assertRaisesRegex(JsonableError, "Stream named existing already exists"):
+            do_unarchive_stream(stream, new_name="existing", acting_user=None)
+
+    def test_unarchive_stream(self) -> None:
+        desdemona = self.example_user("desdemona")
+        iago = self.example_user("iago")
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+
+        stream = self.make_stream("new_stream", is_web_public=True)
+        self.subscribe(hamlet, stream.name)
+        self.subscribe(cordelia, stream.name)
+        do_deactivate_stream(stream, acting_user=None)
+        with self.capture_send_event_calls(expected_num_events=4) as events:
+            do_unarchive_stream(stream, new_name="new_stream", acting_user=None)
+
+        # Tell all admins and owners that the stream exists
+        self.assertEqual(events[0]["event"]["op"], "create")
+        self.assertEqual(events[0]["event"]["streams"][0]["name"], "new_stream")
+        self.assertEqual(events[0]["event"]["streams"][0]["stream_id"], stream.id)
+        self.assertEqual(set(events[0]["users"]), {iago.id, desdemona.id})
+
+        # Tell the owners that they're subscribed to it
+        self.assertEqual(events[1]["event"]["op"], "add")
+        self.assertEqual(events[1]["event"]["subscriptions"][0]["name"], "new_stream")
+        self.assertEqual(events[1]["event"]["subscriptions"][0]["stream_id"], stream.id)
+        self.assertEqual(events[1]["users"], [desdemona.id])
+
+        # Send a message there logging the reactivation
+        self.assertEqual(events[2]["event"]["type"], "message")
+
+        # iago (as an admin) gets to know that desdemona (the owner) is now subscribed.
+        self.assertEqual(
+            events[3],
+            {
+                "event": {
+                    "op": "peer_add",
+                    "stream_ids": [stream.id],
+                    "type": "subscription",
+                    "user_ids": [desdemona.id],
+                },
+                "users": [iago.id],
+            },
+        )
+
+        stream = Stream.objects.get(id=stream.id)
+        self.assertFalse(stream.deactivated)
+        self.assertTrue(stream.invite_only)
+        self.assertFalse(stream.is_web_public)
+        self.assertTrue(stream.history_public_to_subscribers)
+
+        self.assertEqual(
+            [desdemona.id],
+            [
+                sub.user_profile_id
+                for sub in get_active_subscriptions_for_stream_id(
+                    stream.id, include_deactivated_users=True
+                )
+            ],
+        )
 
     def test_vacate_private_stream_removes_default_stream(self) -> None:
         stream = self.make_stream("new_stream", invite_only=True)
@@ -781,17 +1534,15 @@ class StreamAdminTest(ZulipTestCase):
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
 
         result = self.client_delete("/json/streams/999999999")
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
     def test_deactivate_stream_backend_requires_admin(self) -> None:
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
         stream = self.subscribe(user_profile, "new_stream")
-        sub = get_subscription("new_stream", user_profile)
-        self.assertFalse(sub.is_stream_admin)
 
         result = self.client_delete(f"/json/streams/{stream.id}")
-        self.assert_json_error(result, "Must be an organization or stream administrator")
+        self.assert_json_error(result, "Must be an organization administrator")
 
     def test_private_stream_live_updates(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -803,8 +1554,7 @@ class StreamAdminTest(ZulipTestCase):
         self.subscribe(user_profile, "private_stream")
         self.subscribe(self.example_user("cordelia"), "private_stream")
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = get_stream("private_stream", user_profile.realm).id
             result = self.client_patch(
                 f"/json/streams/{stream_id}",
@@ -815,13 +1565,13 @@ class StreamAdminTest(ZulipTestCase):
         cordelia = self.example_user("cordelia")
         prospero = self.example_user("prospero")
 
-        notified_user_ids = set(events[-1]["users"])
+        notified_user_ids = set(events[0]["users"])
         self.assertIn(user_profile.id, notified_user_ids)
         self.assertIn(cordelia.id, notified_user_ids)
         self.assertNotIn(prospero.id, notified_user_ids)
 
-        # Three events should be sent: a name event, an email address event and a notification event
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        # Two events should be sent: a name event and a notification event
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = get_stream("private_stream", user_profile.realm).id
             result = self.client_patch(f"/json/streams/{stream_id}", {"new_name": "whatever"})
         self.assert_json_success(result)
@@ -857,13 +1607,12 @@ class StreamAdminTest(ZulipTestCase):
         result = self.client_patch(f"/json/streams/{stream.id}", {"new_name": "sTREAm_name1"})
         self.assert_json_success(result)
 
-        # Three events should be sent: stream_email update, stream_name update and notification message.
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        # Two events should be sent: stream_name update and notification message.
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = get_stream("stream_name1", user_profile.realm).id
             result = self.client_patch(f"/json/streams/{stream_id}", {"new_name": "stream_name2"})
         self.assert_json_success(result)
-        event = events[1]["event"]
+        event = events[0]["event"]
         self.assertEqual(
             event,
             dict(
@@ -875,7 +1624,7 @@ class StreamAdminTest(ZulipTestCase):
                 name="sTREAm_name1",
             ),
         )
-        notified_user_ids = set(events[1]["users"])
+        notified_user_ids = set(events[0]["users"])
 
         self.assertRaises(Stream.DoesNotExist, get_stream, "stream_name1", realm)
 
@@ -889,7 +1638,7 @@ class StreamAdminTest(ZulipTestCase):
 
         # Test case to handle Unicode stream name change
         # *NOTE: Here encoding is needed when Unicode string is passed as an argument*
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = stream_name2_exists.id
             result = self.client_patch(f"/json/streams/{stream_id}", {"new_name": "नया नाम"})
         self.assert_json_success(result)
@@ -900,7 +1649,7 @@ class StreamAdminTest(ZulipTestCase):
         # Test case to handle changing of Unicode stream name to newer name
         # NOTE: Unicode string being part of URL is handled cleanly
         # by client_patch call, encoding of URL is not needed.
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = stream_name_uni_exists.id
             result = self.client_patch(
                 f"/json/streams/{stream_id}",
@@ -914,7 +1663,7 @@ class StreamAdminTest(ZulipTestCase):
         self.assertTrue(stream_name_new_uni_exists)
 
         # Test case to change name from one language to other.
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = stream_name_new_uni_exists.id
             result = self.client_patch(f"/json/streams/{stream_id}", {"new_name": "français"})
         self.assert_json_success(result)
@@ -922,7 +1671,7 @@ class StreamAdminTest(ZulipTestCase):
         self.assertTrue(stream_name_fr_exists)
 
         # Test case to change name to mixed language name.
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = stream_name_fr_exists.id
             result = self.client_patch(f"/json/streams/{stream_id}", {"new_name": "français name"})
         self.assert_json_success(result)
@@ -934,14 +1683,14 @@ class StreamAdminTest(ZulipTestCase):
             "stream_private_name1", realm=user_profile.realm, invite_only=True
         )
         self.subscribe(self.example_user("cordelia"), "stream_private_name1")
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = get_stream("stream_private_name1", realm).id
             result = self.client_patch(
                 f"/json/streams/{stream_id}",
                 {"new_name": "stream_private_name2"},
             )
         self.assert_json_success(result)
-        notified_user_ids = set(events[1]["users"])
+        notified_user_ids = set(events[0]["users"])
         self.assertEqual(notified_user_ids, can_access_stream_user_ids(stream_private))
         self.assertIn(self.example_user("cordelia").id, notified_user_ids)
         # An important corner case is that all organization admins are notified.
@@ -950,41 +1699,15 @@ class StreamAdminTest(ZulipTestCase):
         self.assertIn(user_profile.id, notified_user_ids)
         self.assertNotIn(self.example_user("prospero").id, notified_user_ids)
 
-        # Test renaming of stream by stream admin.
-        do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=None)
-        new_stream = self.make_stream("new_stream", realm=user_profile.realm)
-        self.subscribe(user_profile, "new_stream")
-        sub = get_subscription("new_stream", user_profile)
-        do_change_subscription_property(
-            user_profile,
-            sub,
-            new_stream,
-            "role",
-            Subscription.ROLE_STREAM_ADMINISTRATOR,
-            acting_user=None,
-        )
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
-            result = self.client_patch(
-                f"/json/streams/{new_stream.id}",
-                {"new_name": "stream_rename"},
-            )
-        self.assert_json_success(result)
-
-        stream_rename_exists = get_stream("stream_rename", realm)
-        self.assertTrue(stream_rename_exists)
-
     def test_rename_stream_requires_admin(self) -> None:
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
         self.make_stream("stream_name1")
         self.subscribe(user_profile, "stream_name1")
 
-        sub = get_subscription("stream_name1", user_profile)
-        self.assertFalse(sub.is_stream_admin)
-
         stream_id = get_stream("stream_name1", user_profile.realm).id
         result = self.client_patch(f"/json/streams/{stream_id}", {"new_name": "stream_name2"})
-        self.assert_json_error(result, "Must be an organization or stream administrator")
+        self.assert_json_error(result, "Must be an organization administrator")
 
     def test_notify_on_stream_rename(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -1034,11 +1757,10 @@ class StreamAdminTest(ZulipTestCase):
         result = self.client_patch(
             f"/json/streams/{stream_id}",
             {
-                "stream_name": orjson.dumps("private_stream").decode(),
                 "is_private": orjson.dumps(True).decode(),
             },
         )
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
     def test_non_admin_cannot_access_unsub_private_stream(self) -> None:
         iago = self.example_user("iago")
@@ -1056,25 +1778,24 @@ class StreamAdminTest(ZulipTestCase):
         stream_id = get_stream("private_stream_1", hamlet.realm).id
 
         result = self.client_patch(f"/json/streams/{stream_id}", {"new_name": "private_stream_2"})
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         result = self.client_patch(
             f"/json/streams/{stream_id}",
             {"description": "new description"},
         )
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         result = self.client_patch(
             f"/json/streams/{stream_id}",
             {
-                "stream_name": "private_stream_1",
                 "is_private": orjson.dumps(True).decode(),
             },
         )
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         result = self.client_delete(f"/json/streams/{stream_id}")
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
     def test_change_stream_description(self) -> None:
         user_profile = self.example_user("iago")
@@ -1082,8 +1803,7 @@ class StreamAdminTest(ZulipTestCase):
         realm = user_profile.realm
         self.subscribe(user_profile, "stream_name1")
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             stream_id = get_stream("stream_name1", realm).id
             result = self.client_patch(
                 f"/json/streams/{stream_id}",
@@ -1111,7 +1831,6 @@ class StreamAdminTest(ZulipTestCase):
         self.assertIn(user_profile.id, notified_user_ids)
         self.assertIn(self.example_user("prospero").id, notified_user_ids)
         self.assertNotIn(self.example_user("polonius").id, notified_user_ids)
-
         self.assertEqual("Test description", stream.description)
 
         result = self.client_patch(f"/json/streams/{stream_id}", {"description": "a" * 1025})
@@ -1122,64 +1841,107 @@ class StreamAdminTest(ZulipTestCase):
 
         result = self.client_patch(
             f"/json/streams/{stream_id}",
+            {"description": ""},
+        )
+        self.assert_json_success(result)
+        stream = get_stream("stream_name1", realm)
+        self.assertEqual(stream.description, "")
+
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        expected_notification = (
+            f"@_**{user_profile.full_name}|{user_profile.id}** changed the description for this stream.\n\n"
+            "* **Old description:**\n"
+            "```` quote\n"
+            "Test description\n"
+            "````\n"
+            "* **New description:**\n"
+            "```` quote\n"
+            "*No description.*\n"
+            "````"
+        )
+        self.assertEqual(messages[-1].content, expected_notification)
+
+        result = self.client_patch(
+            f"/json/streams/{stream_id}",
+            {"description": "Test description"},
+        )
+        self.assert_json_success(result)
+        stream = get_stream("stream_name1", realm)
+        self.assertEqual(stream.description, "Test description")
+
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        expected_notification = (
+            f"@_**{user_profile.full_name}|{user_profile.id}** changed the description for this stream.\n\n"
+            "* **Old description:**\n"
+            "```` quote\n"
+            "*No description.*\n"
+            "````\n"
+            "* **New description:**\n"
+            "```` quote\n"
+            "Test description\n"
+            "````"
+        )
+        self.assertEqual(messages[-1].content, expected_notification)
+
+        result = self.client_patch(
+            f"/json/streams/{stream_id}",
             {"description": "a\nmulti\nline\ndescription"},
         )
         self.assert_json_success(result)
         stream = get_stream("stream_name1", realm)
         self.assertEqual(stream.description, "a multi line description")
 
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        expected_notification = (
+            f"@_**{user_profile.full_name}|{user_profile.id}** changed the description for this stream.\n\n"
+            "* **Old description:**\n"
+            "```` quote\n"
+            "Test description\n"
+            "````\n"
+            "* **New description:**\n"
+            "```` quote\n"
+            "a multi line description\n"
+            "````"
+        )
+        self.assertEqual(messages[-1].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: "Test description",
+            RealmAuditLog.NEW_VALUE: "a multi line description",
+            "property": "description",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
         # Verify that we don't render inline URL previews in this code path.
         with self.settings(INLINE_URL_EMBED_PREVIEW=True):
             result = self.client_patch(
                 f"/json/streams/{stream_id}",
-                {"description": "See https://zulip.com/team"},
+                {"description": "See https://zulip.com/team/"},
             )
         self.assert_json_success(result)
         stream = get_stream("stream_name1", realm)
         self.assertEqual(
             stream.rendered_description,
-            '<p>See <a href="https://zulip.com/team">https://zulip.com/team</a></p>',
+            '<p>See <a href="https://zulip.com/team/">https://zulip.com/team/</a></p>',
         )
-
-        # Test changing stream description by stream admin.
-        do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=None)
-        sub = get_subscription("stream_name1", user_profile)
-        do_change_subscription_property(
-            user_profile,
-            sub,
-            stream,
-            "role",
-            Subscription.ROLE_STREAM_ADMINISTRATOR,
-            acting_user=None,
-        )
-
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
-            stream_id = get_stream("stream_name1", realm).id
-            result = self.client_patch(
-                f"/json/streams/{stream_id}",
-                {"description": "Test description"},
-            )
-        self.assert_json_success(result)
-        stream = get_stream("stream_name1", realm)
-        self.assertEqual(stream.description, "Test description")
 
     def test_change_stream_description_requires_admin(self) -> None:
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
 
-        stream = self.subscribe(user_profile, "stream_name1")
-        sub = get_subscription("stream_name1", user_profile)
-
+        self.subscribe(user_profile, "stream_name1")
         do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=None)
-        do_change_subscription_property(
-            user_profile, sub, stream, "role", Subscription.ROLE_MEMBER, acting_user=None
-        )
 
         stream_id = get_stream("stream_name1", user_profile.realm).id
         result = self.client_patch(
             f"/json/streams/{stream_id}", {"description": "Test description"}
         )
-        self.assert_json_error(result, "Must be an organization or stream administrator")
+        self.assert_json_error(result, "Must be an organization administrator")
 
     def test_change_to_stream_post_policy_admins(self) -> None:
         user_profile = self.example_user("hamlet")
@@ -1194,19 +1956,36 @@ class StreamAdminTest(ZulipTestCase):
         )
         self.assert_json_success(result)
         stream = get_stream("stream_name1", user_profile.realm)
-        self.assertTrue(stream.stream_post_policy == Stream.STREAM_POST_POLICY_ADMINS)
+        self.assertEqual(stream.stream_post_policy, Stream.STREAM_POST_POLICY_ADMINS)
+
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        expected_notification = (
+            f"@_**{user_profile.full_name}|{user_profile.id}** changed the "
+            "[posting permissions](/help/stream-sending-policy) for this stream:\n\n"
+            "* **Old permissions**: All stream members can post.\n"
+            "* **New permissions**: Only organization administrators can post."
+        )
+        self.assertEqual(messages[-1].content, expected_notification)
+
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+            modified_stream=stream,
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: Stream.STREAM_POST_POLICY_EVERYONE,
+            RealmAuditLog.NEW_VALUE: Stream.STREAM_POST_POLICY_ADMINS,
+            "property": "stream_post_policy",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
 
     def test_change_stream_post_policy_requires_admin(self) -> None:
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
 
         stream = self.subscribe(user_profile, "stream_name1")
-        sub = get_subscription("stream_name1", user_profile)
 
         do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=None)
-        do_change_subscription_property(
-            user_profile, sub, stream, "role", Subscription.ROLE_MEMBER, acting_user=None
-        )
 
         do_set_realm_property(user_profile.realm, "waiting_period_threshold", 10, acting_user=None)
 
@@ -1218,7 +1997,7 @@ class StreamAdminTest(ZulipTestCase):
             result = self.client_patch(
                 f"/json/streams/{stream_id}", {"stream_post_policy": orjson.dumps(policy).decode()}
             )
-            self.assert_json_error(result, "Must be an organization or stream administrator")
+            self.assert_json_error(result, "Must be an organization administrator")
 
         policies = [
             Stream.STREAM_POST_POLICY_ADMINS,
@@ -1230,50 +2009,128 @@ class StreamAdminTest(ZulipTestCase):
             test_non_admin(how_old=15, is_new=False, policy=policy)
             test_non_admin(how_old=5, is_new=True, policy=policy)
 
-        do_change_subscription_property(
-            user_profile,
-            sub,
-            stream,
-            "role",
-            Subscription.ROLE_STREAM_ADMINISTRATOR,
-            acting_user=None,
-        )
-
-        for policy in policies:
-            stream_id = get_stream("stream_name1", user_profile.realm).id
-            result = self.client_patch(
-                f"/json/streams/{stream_id}", {"stream_post_policy": orjson.dumps(policy).decode()}
-            )
-            self.assert_json_success(result)
-            stream = get_stream("stream_name1", user_profile.realm)
-            self.assertEqual(stream.stream_post_policy, policy)
-
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
 
         for policy in policies:
-            stream_id = get_stream("stream_name1", user_profile.realm).id
+            stream = get_stream("stream_name1", user_profile.realm)
+            old_post_policy = stream.stream_post_policy
             result = self.client_patch(
-                f"/json/streams/{stream_id}", {"stream_post_policy": orjson.dumps(policy).decode()}
+                f"/json/streams/{stream.id}", {"stream_post_policy": orjson.dumps(policy).decode()}
             )
             self.assert_json_success(result)
             stream = get_stream("stream_name1", user_profile.realm)
             self.assertEqual(stream.stream_post_policy, policy)
+
+            messages = get_topic_messages(user_profile, stream, "stream events")
+            expected_notification = (
+                f"@_**{user_profile.full_name}|{user_profile.id}** changed the "
+                "[posting permissions](/help/stream-sending-policy) for this stream:\n\n"
+                f"* **Old permissions**: {Stream.POST_POLICIES[old_post_policy]}.\n"
+                f"* **New permissions**: {Stream.POST_POLICIES[policy]}."
+            )
+
+            self.assertEqual(messages[-1].content, expected_notification)
+
+            realm_audit_log = RealmAuditLog.objects.filter(
+                event_type=RealmAuditLog.STREAM_PROPERTY_CHANGED,
+                modified_stream=stream,
+            ).last()
+            assert realm_audit_log is not None
+            expected_extra_data = {
+                RealmAuditLog.OLD_VALUE: old_post_policy,
+                RealmAuditLog.NEW_VALUE: policy,
+                "property": "stream_post_policy",
+            }
+            self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
+    def test_change_stream_message_retention_days_notifications(self) -> None:
+        user_profile = self.example_user("desdemona")
+        self.login_user(user_profile)
+        realm = user_profile.realm
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=None)
+        stream = self.subscribe(user_profile, "stream_name1")
+
+        # Go from realm default (forever) to 2 days
+        result = self.client_patch(
+            f"/json/streams/{stream.id}", {"message_retention_days": orjson.dumps(2).decode()}
+        )
+        self.assert_json_success(result)
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 1)
+        expected_notification = (
+            f"@_**Desdemona|{user_profile.id}** has changed the [message retention period](/help/message-retention-policy) for this stream:\n"
+            "* **Old retention period**: Forever\n"
+            "* **New retention period**: 2 days\n\n"
+            "Messages in this stream will now be automatically deleted 2 days after they are sent."
+        )
+        self.assertEqual(messages[0].content, expected_notification)
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_MESSAGE_RETENTION_DAYS_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {RealmAuditLog.OLD_VALUE: None, RealmAuditLog.NEW_VALUE: 2}
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
+        # Go from 2 days to 8 days
+        result = self.client_patch(
+            f"/json/streams/{stream.id}", {"message_retention_days": orjson.dumps(8).decode()}
+        )
+        self.assert_json_success(result)
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 2)
+        expected_notification = (
+            f"@_**Desdemona|{user_profile.id}** has changed the [message retention period](/help/message-retention-policy) for this stream:\n"
+            "* **Old retention period**: 2 days\n"
+            "* **New retention period**: 8 days\n\n"
+            "Messages in this stream will now be automatically deleted 8 days after they are sent."
+        )
+        self.assertEqual(messages[1].content, expected_notification)
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_MESSAGE_RETENTION_DAYS_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {RealmAuditLog.OLD_VALUE: 2, RealmAuditLog.NEW_VALUE: 8}
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+
+        # Go from 8 days to realm default (None on stream, forever/-1 on realm)
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"message_retention_days": orjson.dumps("realm_default").decode()},
+        )
+        self.assert_json_success(result)
+        messages = get_topic_messages(user_profile, stream, "stream events")
+        self.assert_length(messages, 3)
+        expected_notification = (
+            f"@_**Desdemona|{user_profile.id}** has changed the [message retention period](/help/message-retention-policy) for this stream:\n"
+            "* **Old retention period**: 8 days\n"
+            "* **New retention period**: Forever\n\n"
+            "Messages in this stream will now be retained forever."
+        )
+        self.assertEqual(messages[2].content, expected_notification)
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=RealmAuditLog.STREAM_MESSAGE_RETENTION_DAYS_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            RealmAuditLog.OLD_VALUE: 8,
+            RealmAuditLog.NEW_VALUE: None,
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
 
     def test_change_stream_message_retention_days(self) -> None:
         user_profile = self.example_user("desdemona")
         self.login_user(user_profile)
         realm = user_profile.realm
-        do_change_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
         stream = self.subscribe(user_profile, "stream_name1")
 
         result = self.client_patch(
             f"/json/streams/{stream.id}", {"message_retention_days": orjson.dumps(2).decode()}
         )
-        self.assert_json_error(result, "Available on Zulip Standard. Upgrade to access.")
+        self.assert_json_error(result, "Available on Zulip Cloud Standard. Upgrade to access.")
 
-        do_change_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=None)
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=None)
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             result = self.client_patch(
                 f"/json/streams/{stream.id}", {"message_retention_days": orjson.dumps(2).decode()}
             )
@@ -1300,7 +2157,7 @@ class StreamAdminTest(ZulipTestCase):
         self.assertNotIn(self.example_user("polonius").id, notified_user_ids)
         self.assertEqual(stream.message_retention_days, 2)
 
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             result = self.client_patch(
                 f"/json/streams/{stream.id}",
                 {"message_retention_days": orjson.dumps("unlimited").decode()},
@@ -1322,7 +2179,7 @@ class StreamAdminTest(ZulipTestCase):
         stream = get_stream("stream_name1", realm)
         self.assertEqual(stream.message_retention_days, -1)
 
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             result = self.client_patch(
                 f"/json/streams/{stream.id}",
                 {"message_retention_days": orjson.dumps("realm_default").decode()},
@@ -1377,6 +2234,90 @@ class StreamAdminTest(ZulipTestCase):
         self.assert_json_success(result)
         stream = get_stream("stream_name1", realm)
         self.assertEqual(stream.message_retention_days, 2)
+
+    def test_change_stream_can_remove_subscribers_group(self) -> None:
+        user_profile = self.example_user("iago")
+        realm = user_profile.realm
+        stream = self.subscribe(user_profile, "stream_name1")
+
+        moderators_system_group = UserGroup.objects.get(
+            name="role:moderators", realm=realm, is_system_group=True
+        )
+        self.login("shiva")
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(moderators_system_group.id).decode()},
+        )
+        self.assert_json_error(result, "Must be an organization administrator")
+
+        self.login("iago")
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(moderators_system_group.id).decode()},
+        )
+        self.assert_json_success(result)
+        stream = get_stream("stream_name1", realm)
+        self.assertEqual(stream.can_remove_subscribers_group.id, moderators_system_group.id)
+
+        # This setting can only be set to system groups.
+        hamletcharacters_group = UserGroup.objects.get(name="hamletcharacters", realm=realm)
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(hamletcharacters_group.id).decode()},
+        )
+        self.assert_json_error(
+            result, "'can_remove_subscribers_group' must be a system user group."
+        )
+
+        internet_group = UserGroup.objects.get(
+            name="role:internet", is_system_group=True, realm=realm
+        )
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(internet_group.id).decode()},
+        )
+        self.assert_json_error(
+            result,
+            "'can_remove_subscribers_group' setting cannot be set to 'role:internet' group.",
+        )
+
+        owners_group = UserGroup.objects.get(name="role:owners", is_system_group=True, realm=realm)
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(owners_group.id).decode()},
+        )
+        self.assert_json_error(
+            result,
+            "'can_remove_subscribers_group' setting cannot be set to 'role:owners' group.",
+        )
+
+        nobody_group = UserGroup.objects.get(name="role:nobody", is_system_group=True, realm=realm)
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(nobody_group.id).decode()},
+        )
+        self.assert_json_error(
+            result,
+            "'can_remove_subscribers_group' setting cannot be set to 'role:nobody' group.",
+        )
+
+        # For private streams, even admins must be subscribed to the stream to change
+        # can_remove_subscribers_group setting.
+        stream = self.make_stream("stream_name2", invite_only=True)
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(moderators_system_group.id).decode()},
+        )
+        self.assert_json_error(result, "Invalid stream ID")
+
+        self.subscribe(user_profile, "stream_name2")
+        result = self.client_patch(
+            f"/json/streams/{stream.id}",
+            {"can_remove_subscribers_group": orjson.dumps(moderators_system_group.id).decode()},
+        )
+        self.assert_json_success(result)
+        stream = get_stream("stream_name2", realm)
+        self.assertEqual(stream.can_remove_subscribers_group.id, moderators_system_group.id)
 
     def test_stream_message_retention_days_on_stream_creation(self) -> None:
         """
@@ -1437,13 +2378,13 @@ class StreamAdminTest(ZulipTestCase):
             },
         ]
 
-        do_change_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=admin)
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=admin)
         with self.assertRaisesRegex(
-            JsonableError, "Available on Zulip Standard. Upgrade to access."
+            JsonableError, "Available on Zulip Cloud Standard. Upgrade to access."
         ):
             list_to_streams(streams_raw, owner, autocreate=True)
 
-        do_change_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=admin)
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=admin)
         result = list_to_streams(streams_raw, owner, autocreate=True)
         self.assert_length(result[0], 0)
         self.assert_length(result[1], 3)
@@ -1483,10 +2424,9 @@ class StreamAdminTest(ZulipTestCase):
         # Simulate that a stream by the same name has already been
         # deactivated, just to exercise our renaming logic:
         # Since we do not know the id of these simulated stream we prepend the name with a random hashed_stream_id
-        ensure_stream(realm, "DB32B77" + "!DEACTIVATED:" + active_name, acting_user=None)
+        ensure_stream(realm, "DB32B77!DEACTIVATED:" + active_name, acting_user=None)
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.client_delete("/json/streams/" + str(stream_id))
         self.assert_json_success(result)
 
@@ -1516,7 +2456,7 @@ class StreamAdminTest(ZulipTestCase):
 
         # It doesn't show up in the list of public streams anymore.
         result = self.client_get("/json/streams", {"include_subscribed": "false"})
-        public_streams = [s["name"] for s in result.json()["streams"]]
+        public_streams = [s["name"] for s in self.assert_json_success(result)["streams"]]
         self.assertNotIn(active_name, public_streams)
         self.assertNotIn(deactivated_stream_name, public_streams)
 
@@ -1526,6 +2466,11 @@ class StreamAdminTest(ZulipTestCase):
             {"subscriptions": orjson.dumps([{"name": deactivated_stream_name}]).decode()},
         )
         self.assert_json_error(result, f"Unable to access stream ({deactivated_stream_name}).")
+
+        # You cannot re-archive the stream
+        with self.capture_send_event_calls(expected_num_events=0) as events:
+            result = self.client_delete("/json/streams/" + str(stream_id))
+        self.assert_json_error(result, "Stream is already deactivated")
 
     def test_you_must_be_realm_admin(self) -> None:
         """
@@ -1538,13 +2483,13 @@ class StreamAdminTest(ZulipTestCase):
         stream = self.make_stream("other_realm_stream", realm=other_realm)
 
         result = self.client_delete("/json/streams/" + str(stream.id))
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         # Even becoming a realm admin doesn't help us for an out-of-realm
         # stream.
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         result = self.client_delete("/json/streams/" + str(stream.id))
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
     def test_delete_public_stream(self) -> None:
         """
@@ -1561,14 +2506,17 @@ class StreamAdminTest(ZulipTestCase):
         stream = self.set_up_stream_for_archiving("newstream", invite_only=True)
         self.archive_stream(stream)
 
-    def test_archive_streams_youre_not_on(self) -> None:
+    def test_archive_stream_youre_not_on(self) -> None:
         """
-        Administrators can delete public streams they aren't on, including
-        private streams in their realm.
+        Administrators can delete public streams they aren't on
         """
         pub_stream = self.set_up_stream_for_archiving("pubstream", subscribed=False)
         self.archive_stream(pub_stream)
 
+    def test_archive_invite_only_stream_youre_not_on(self) -> None:
+        """
+        Administrators can delete invite-only streams they aren't on
+        """
         priv_stream = self.set_up_stream_for_archiving(
             "privstream", subscribed=False, invite_only=True
         )
@@ -1580,14 +2528,12 @@ class StreamAdminTest(ZulipTestCase):
         query_count: int,
         cache_count: Optional[int] = None,
         is_realm_admin: bool = False,
-        is_stream_admin: bool = False,
         is_subbed: bool = True,
         invite_only: bool = False,
         target_users_subbed: bool = True,
         using_legacy_emails: bool = False,
         other_sub_users: Sequence[UserProfile] = [],
-    ) -> HttpResponse:
-
+    ) -> "TestHttpResponse":
         # Set up the main user, who is in most cases an admin.
         if is_realm_admin:
             user_profile = self.example_user("iago")
@@ -1601,46 +2547,31 @@ class StreamAdminTest(ZulipTestCase):
         self.make_stream(stream_name, invite_only=invite_only)
 
         # Set up the principal to be unsubscribed.
-        principals: List[Union[str, int]] = []
-        for user in target_users:
-            if using_legacy_emails:
-                principals.append(user.email)
-            else:
-                principals.append(user.id)
+        principals = [user.email if using_legacy_emails else user.id for user in target_users]
 
         # Subscribe the admin and/or principal as specified in the flags.
         if is_subbed:
-            stream = self.subscribe(user_profile, stream_name)
-            if is_stream_admin:
-                sub = get_subscription(stream_name, user_profile)
-                do_change_subscription_property(
-                    user_profile,
-                    sub,
-                    stream,
-                    "role",
-                    Subscription.ROLE_STREAM_ADMINISTRATOR,
-                    acting_user=None,
-                )
+            self.subscribe(user_profile, stream_name)
         if target_users_subbed:
             for user in target_users:
                 self.subscribe(user, stream_name)
         for user in other_sub_users:
             self.subscribe(user, stream_name)
 
-        with queries_captured() as queries:
+        with self.assert_database_query_count(query_count):
             with cache_tries_captured() as cache_tries:
-                result = self.client_delete(
-                    "/json/users/me/subscriptions",
-                    {
-                        "subscriptions": orjson.dumps([stream_name]).decode(),
-                        "principals": orjson.dumps(principals).decode(),
-                    },
-                )
-        self.assert_length(queries, query_count)
+                with self.captureOnCommitCallbacks(execute=True):
+                    result = self.client_delete(
+                        "/json/users/me/subscriptions",
+                        {
+                            "subscriptions": orjson.dumps([stream_name]).decode(),
+                            "principals": orjson.dumps(principals).decode(),
+                        },
+                    )
         if cache_count is not None:
             self.assert_length(cache_tries, cache_count)
 
-        # If the removal succeeded, then assert that Cordelia is no longer subscribed.
+        # If the removal succeeded, assert all target users are no longer subscribed.
         if result.status_code not in [400]:
             subbed_users = self.users_subscribed_to_stream(stream_name, user_profile.realm)
             for user in target_users:
@@ -1648,20 +2579,19 @@ class StreamAdminTest(ZulipTestCase):
 
         return result
 
-    def test_cant_remove_others_from_stream(self) -> None:
+    def test_cant_remove_other_users_from_stream(self) -> None:
         """
-        If you're not an admin, you can't remove other people from streams.
+        If you're not an admin, you can't remove other people from streams except your own bots.
         """
         result = self.attempt_unsubscribe_of_principal(
-            query_count=5,
+            query_count=8,
             target_users=[self.example_user("cordelia")],
             is_realm_admin=False,
-            is_stream_admin=False,
             is_subbed=True,
             invite_only=False,
             target_users_subbed=True,
         )
-        self.assert_json_error(result, "Must be an organization or stream administrator")
+        self.assert_json_error(result, "Insufficient permission")
 
     def test_realm_admin_remove_others_from_public_stream(self) -> None:
         """
@@ -1669,7 +2599,7 @@ class StreamAdminTest(ZulipTestCase):
         those you aren't on.
         """
         result = self.attempt_unsubscribe_of_principal(
-            query_count=16,
+            query_count=17,
             target_users=[self.example_user("cordelia")],
             is_realm_admin=True,
             is_subbed=True,
@@ -1692,11 +2622,12 @@ class StreamAdminTest(ZulipTestCase):
               using a queue.
         """
         target_users = [
-            self.example_user(name) for name in ["cordelia", "prospero", "iago", "hamlet", "ZOE"]
+            self.example_user(name)
+            for name in ["cordelia", "prospero", "iago", "hamlet", "outgoing_webhook_bot"]
         ]
         result = self.attempt_unsubscribe_of_principal(
-            query_count=31,
-            cache_count=9,
+            query_count=28,
+            cache_count=8,
             target_users=target_users,
             is_realm_admin=True,
             is_subbed=True,
@@ -1742,77 +2673,21 @@ class StreamAdminTest(ZulipTestCase):
         self.assert_length(json["removed"], 1)
         self.assert_length(json["not_removed"], 0)
 
-    def test_stream_admin_remove_others_from_public_stream(self) -> None:
-        """
-        You can remove others from public streams you're a stream administrator of.
-        """
-        result = self.attempt_unsubscribe_of_principal(
-            query_count=16,
-            target_users=[self.example_user("cordelia")],
-            is_realm_admin=False,
-            is_stream_admin=True,
-            is_subbed=True,
-            invite_only=False,
-            target_users_subbed=True,
-        )
-        json = self.assert_json_success(result)
-        self.assert_length(json["removed"], 1)
-        self.assert_length(json["not_removed"], 0)
-
-    def test_stream_admin_remove_multiple_users_from_stream(self) -> None:
-        """
-        You can remove multiple users from public streams you're a stream administrator of.
-        """
-        target_users = [
-            self.example_user(name) for name in ["cordelia", "prospero", "othello", "hamlet", "ZOE"]
-        ]
-        result = self.attempt_unsubscribe_of_principal(
-            query_count=31,
-            cache_count=9,
-            target_users=target_users,
-            is_realm_admin=False,
-            is_stream_admin=True,
-            is_subbed=True,
-            invite_only=False,
-            target_users_subbed=True,
-        )
-        json = self.assert_json_success(result)
-        self.assert_length(json["removed"], 5)
-        self.assert_length(json["not_removed"], 0)
-
-    def test_stream_admin_remove_others_from_private_stream(self) -> None:
-        """
-        You can remove others from private streams you're a stream administrator of.
-        """
-        result = self.attempt_unsubscribe_of_principal(
-            query_count=17,
-            target_users=[self.example_user("cordelia")],
-            is_realm_admin=False,
-            is_stream_admin=True,
-            is_subbed=True,
-            invite_only=True,
-            target_users_subbed=True,
-        )
-        json = self.assert_json_success(result)
-        self.assert_length(json["removed"], 1)
-        self.assert_length(json["not_removed"], 0)
-
     def test_cant_remove_others_from_stream_legacy_emails(self) -> None:
         result = self.attempt_unsubscribe_of_principal(
-            query_count=5,
+            query_count=8,
             is_realm_admin=False,
-            is_stream_admin=False,
             is_subbed=True,
             invite_only=False,
             target_users=[self.example_user("cordelia")],
             target_users_subbed=True,
             using_legacy_emails=True,
         )
-        self.assert_json_error(result, "Must be an organization or stream administrator")
+        self.assert_json_error(result, "Insufficient permission")
 
     def test_admin_remove_others_from_stream_legacy_emails(self) -> None:
         result = self.attempt_unsubscribe_of_principal(
-            query_count=16,
+            query_count=17,
             target_users=[self.example_user("cordelia")],
             is_realm_admin=True,
             is_subbed=True,
@@ -1838,13 +2713,26 @@ class StreamAdminTest(ZulipTestCase):
         self.assert_length(json["removed"], 2)
         self.assert_length(json["not_removed"], 0)
 
+    def test_remove_unsubbed_user_along_with_subbed(self) -> None:
+        result = self.attempt_unsubscribe_of_principal(
+            query_count=17,
+            target_users=[self.example_user("cordelia"), self.example_user("iago")],
+            is_realm_admin=True,
+            is_subbed=True,
+            invite_only=False,
+            target_users_subbed=False,
+        )
+        json = self.assert_json_success(result)
+        self.assert_length(json["removed"], 1)
+        self.assert_length(json["not_removed"], 1)
+
     def test_remove_already_not_subbed(self) -> None:
         """
         Trying to unsubscribe someone who already isn't subscribed to a stream
         fails gracefully.
         """
         result = self.attempt_unsubscribe_of_principal(
-            query_count=10,
+            query_count=9,
             target_users=[self.example_user("cordelia")],
             is_realm_admin=True,
             is_subbed=False,
@@ -1854,6 +2742,94 @@ class StreamAdminTest(ZulipTestCase):
         json = self.assert_json_success(result)
         self.assert_length(json["removed"], 0)
         self.assert_length(json["not_removed"], 1)
+
+    def test_bot_owner_can_remove_bot_from_stream(self) -> None:
+        user_profile = self.example_user("hamlet")
+        webhook_bot = self.example_user("webhook_bot")
+        do_change_bot_owner(webhook_bot, bot_owner=user_profile, acting_user=user_profile)
+        result = self.attempt_unsubscribe_of_principal(
+            query_count=14,
+            target_users=[webhook_bot],
+            is_realm_admin=False,
+            is_subbed=True,
+            invite_only=False,
+            target_users_subbed=True,
+        )
+        self.assert_json_success(result)
+
+    def test_non_bot_owner_cannot_remove_bot_from_stream(self) -> None:
+        other_user = self.example_user("cordelia")
+        webhook_bot = self.example_user("webhook_bot")
+        do_change_bot_owner(webhook_bot, bot_owner=other_user, acting_user=other_user)
+        result = self.attempt_unsubscribe_of_principal(
+            query_count=8,
+            target_users=[webhook_bot],
+            is_realm_admin=False,
+            is_subbed=True,
+            invite_only=False,
+            target_users_subbed=True,
+        )
+        self.assert_json_error(result, "Insufficient permission")
+
+    def test_can_remove_subscribers_group(self) -> None:
+        realm = get_realm("zulip")
+        leadership_group = check_add_user_group(
+            realm,
+            "leadership",
+            [self.example_user("iago"), self.example_user("shiva")],
+            acting_user=None,
+        )
+        managers_group = check_add_user_group(
+            realm, "managers", [self.example_user("hamlet")], acting_user=None
+        )
+        add_subgroups_to_user_group(managers_group, [leadership_group], acting_user=None)
+        cordelia = self.example_user("cordelia")
+
+        stream = self.make_stream("public_stream")
+
+        def check_unsubscribing_user(
+            user: UserProfile, can_remove_subscribers_group: UserGroup, expect_fail: bool = False
+        ) -> None:
+            self.login_user(user)
+            self.subscribe(cordelia, stream.name)
+            do_change_stream_group_based_setting(
+                stream,
+                "can_remove_subscribers_group",
+                can_remove_subscribers_group,
+                acting_user=None,
+            )
+            result = self.client_delete(
+                "/json/users/me/subscriptions",
+                {
+                    "subscriptions": orjson.dumps([stream.name]).decode(),
+                    "principals": orjson.dumps([cordelia.id]).decode(),
+                },
+            )
+            if expect_fail:
+                self.assert_json_error(result, "Insufficient permission")
+                return
+
+            json = self.assert_json_success(result)
+            self.assert_length(json["removed"], 1)
+            self.assert_length(json["not_removed"], 0)
+
+        check_unsubscribing_user(self.example_user("hamlet"), leadership_group, expect_fail=True)
+        check_unsubscribing_user(self.example_user("desdemona"), leadership_group, expect_fail=True)
+        check_unsubscribing_user(self.example_user("iago"), leadership_group)
+
+        check_unsubscribing_user(self.example_user("othello"), managers_group, expect_fail=True)
+        check_unsubscribing_user(self.example_user("shiva"), managers_group)
+        check_unsubscribing_user(self.example_user("hamlet"), managers_group)
+
+        stream = self.make_stream("private_stream", invite_only=True)
+        self.subscribe(self.example_user("hamlet"), stream.name)
+        # Non-admins are not allowed to unsubscribe others from private streams that they
+        # are not subscribed to even if they are member of the allowed group.
+        check_unsubscribing_user(self.example_user("shiva"), leadership_group, expect_fail=True)
+        check_unsubscribing_user(self.example_user("iago"), leadership_group)
+
+        self.subscribe(self.example_user("shiva"), stream.name)
+        check_unsubscribing_user(self.example_user("shiva"), leadership_group)
 
     def test_remove_invalid_user(self) -> None:
         """
@@ -1873,16 +2849,40 @@ class StreamAdminTest(ZulipTestCase):
                 "principals": orjson.dumps([99]).decode(),
             },
         )
-        self.assert_json_error(
-            result, "User not authorized to execute queries on behalf of '99'", status_code=403
-        )
+        self.assert_json_error(result, "No such user", status_code=400)
 
 
 class DefaultStreamTest(ZulipTestCase):
     def get_default_stream_names(self, realm: Realm) -> Set[str]:
-        streams = get_default_streams_for_realm(realm.id)
-        stream_names = [s.name for s in streams]
-        return set(stream_names)
+        streams = get_default_streams_for_realm_as_dicts(realm.id)
+        return {s["name"] for s in streams}
+
+    def test_query_count(self) -> None:
+        DefaultStream.objects.all().delete()
+        realm = get_realm("zulip")
+
+        new_stream_ids = set()
+
+        for i in range(5):
+            stream = ensure_stream(realm, f"stream {i}", acting_user=None)
+            new_stream_ids.add(stream.id)
+            do_add_default_stream(stream)
+
+        with queries_captured() as queries:
+            default_streams = get_default_streams_for_realm_as_dicts(realm.id)
+
+        self.assert_length(queries, 1)
+        self.assert_length(default_streams, 5)
+        self.assertEqual({dct["stream_id"] for dct in default_streams}, new_stream_ids)
+
+        # Make sure our query isn't some bloated select_related query.
+        self.assertLess(len(queries[0].sql), 800)
+
+        with queries_captured() as queries:
+            default_stream_ids = get_default_stream_ids_for_realm(realm.id)
+
+        self.assert_length(queries, 1)
+        self.assertEqual(default_stream_ids, new_stream_ids)
 
     def test_add_and_remove_default_stream(self) -> None:
         realm = get_realm("zulip")
@@ -1892,14 +2892,14 @@ class DefaultStreamTest(ZulipTestCase):
         new_stream_names = self.get_default_stream_names(realm)
         added_stream_names = new_stream_names - orig_stream_names
         self.assertEqual(added_stream_names, {"Added stream"})
-        # idempotentcy--2nd call to add_default_stream should be a noop
+        # idempotency--2nd call to add_default_stream should be a noop
         do_add_default_stream(stream)
         self.assertEqual(self.get_default_stream_names(realm), new_stream_names)
 
         # start removing
         do_remove_default_stream(stream)
         self.assertEqual(self.get_default_stream_names(realm), orig_stream_names)
-        # idempotentcy--2nd call to remove_default_stream should be a noop
+        # idempotency--2nd call to remove_default_stream should be a noop
         do_remove_default_stream(stream)
         self.assertEqual(self.get_default_stream_names(realm), orig_stream_names)
 
@@ -1923,8 +2923,7 @@ class DefaultStreamTest(ZulipTestCase):
             include_default="true",
         )
         result = self.client_get("/json/streams", payload)
-        self.assert_json_success(result)
-        streams = result.json()["streams"]
+        streams = self.assert_json_success(result)["streams"]
         default_streams = {stream["name"] for stream in streams if stream["is_default"]}
         self.assertEqual(default_streams, {stream_name})
 
@@ -1941,7 +2940,7 @@ class DefaultStreamTest(ZulipTestCase):
         stream = self.make_stream(stream_name, invite_only=True)
         self.subscribe(self.example_user("iago"), stream_name)
         result = self.client_post("/json/default_streams", dict(stream_id=stream.id))
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         # Test admin can't add subscribed private stream also.
         self.subscribe(user_profile, stream_name)
@@ -1953,9 +2952,9 @@ class DefaultStreamTest(ZulipTestCase):
         self.login_user(user_profile)
         self.assertEqual(user_profile.role, UserProfile.ROLE_GUEST)
 
-        # Get all the streams that Polonius has access to (subscribed + web public streams)
+        # Get all the streams that Polonius has access to (subscribed + web-public streams)
         result = self.client_get("/json/streams", {"include_web_public": "true"})
-        streams = result.json()["streams"]
+        streams = self.assert_json_success(result)["streams"]
         sub_info = gather_subscriptions_helper(user_profile)
 
         subscribed = sub_info.subscriptions
@@ -1963,9 +2962,9 @@ class DefaultStreamTest(ZulipTestCase):
         never_subscribed = sub_info.never_subscribed
 
         self.assert_length(streams, len(subscribed) + len(unsubscribed) + len(never_subscribed))
-        expected_streams = subscribed + unsubscribed + never_subscribed
         stream_names = [stream["name"] for stream in streams]
-        expected_stream_names = [stream["name"] for stream in expected_streams]
+        expected_stream_names = [stream["name"] for stream in subscribed + unsubscribed]
+        expected_stream_names += [stream["name"] for stream in never_subscribed]
         self.assertEqual(set(stream_names), set(expected_stream_names))
 
 
@@ -1977,10 +2976,10 @@ class DefaultStreamGroupTest(ZulipTestCase):
         default_stream_groups = get_default_stream_groups(realm)
         self.assert_length(default_stream_groups, 0)
 
-        streams = []
-        for stream_name in ["stream1", "stream2", "stream3"]:
-            stream = ensure_stream(realm, stream_name, acting_user=None)
-            streams.append(stream)
+        streams = [
+            ensure_stream(realm, stream_name, acting_user=None)
+            for stream_name in ["stream1", "stream2", "stream3"]
+        ]
 
         def get_streams(group: DefaultStreamGroup) -> List[Stream]:
             return list(group.streams.all().order_by("name"))
@@ -1996,12 +2995,19 @@ class DefaultStreamGroupTest(ZulipTestCase):
 
         # Test adding streams to existing default stream group
         group = lookup_default_stream_groups(["group1"], realm)[0]
-        new_stream_names = ["stream4", "stream5"]
-        new_streams = []
-        for new_stream_name in new_stream_names:
-            new_stream = ensure_stream(realm, new_stream_name, acting_user=None)
-            new_streams.append(new_stream)
-            streams.append(new_stream)
+        new_stream_names = [
+            "stream4",
+            "stream5",
+            "stream6",
+            "stream7",
+            "stream8",
+            "stream9",
+        ]
+        new_streams = [
+            ensure_stream(realm, new_stream_name, acting_user=None)
+            for new_stream_name in new_stream_names
+        ]
+        streams += new_streams
 
         do_add_streams_to_default_stream_group(realm, group, new_streams)
         default_stream_groups = get_default_stream_groups(realm)
@@ -2010,7 +3016,8 @@ class DefaultStreamGroupTest(ZulipTestCase):
         self.assertEqual(get_streams(default_stream_groups[0]), streams)
 
         # Test removing streams from existing default stream group
-        do_remove_streams_from_default_stream_group(realm, group, new_streams)
+        with self.assert_database_query_count(5):
+            do_remove_streams_from_default_stream_group(realm, group, new_streams)
         remaining_streams = streams[0:3]
         default_stream_groups = get_default_stream_groups(realm)
         self.assert_length(default_stream_groups, 1)
@@ -2056,13 +3063,12 @@ class DefaultStreamGroupTest(ZulipTestCase):
         stream_names = ["stream1", "stream2", "stream3"]
         group_name = "group1"
         description = "This is group1"
-        streams = []
         default_stream_groups = get_default_stream_groups(realm)
         self.assert_length(default_stream_groups, 0)
 
-        for stream_name in stream_names:
-            stream = ensure_stream(realm, stream_name, acting_user=None)
-            streams.append(stream)
+        streams = [
+            ensure_stream(realm, stream_name, acting_user=None) for stream_name in stream_names
+        ]
 
         result = self.client_post(
             "/json/default_stream_groups/create",
@@ -2093,11 +3099,11 @@ class DefaultStreamGroupTest(ZulipTestCase):
         # Test adding streams to existing default stream group
         group_id = default_stream_groups[0].id
         new_stream_names = ["stream4", "stream5"]
-        new_streams = []
-        for new_stream_name in new_stream_names:
-            new_stream = ensure_stream(realm, new_stream_name, acting_user=None)
-            new_streams.append(new_stream)
-            streams.append(new_stream)
+        new_streams = [
+            ensure_stream(realm, new_stream_name, acting_user=None)
+            for new_stream_name in new_stream_names
+        ]
+        streams += new_streams
 
         result = self.client_patch(
             f"/json/default_stream_groups/{group_id}/streams",
@@ -2183,24 +3189,18 @@ class DefaultStreamGroupTest(ZulipTestCase):
         # Test changing description of default stream group
         new_description = "new group1 description"
 
-        result = self.client_patch(
-            f"/json/default_stream_groups/{group_id}", {"group_name": group_name, "op": "change"}
-        )
+        result = self.client_patch(f"/json/default_stream_groups/{group_id}")
         self.assert_json_error(result, 'You must pass "new_description" or "new_group_name".')
 
         result = self.client_patch(
             "/json/default_stream_groups/12345",
-            {"op": "change", "new_description": new_description},
+            {"new_description": new_description},
         )
         self.assert_json_error(result, "Default stream group with id '12345' does not exist.")
 
         result = self.client_patch(
             f"/json/default_stream_groups/{group_id}",
-            {
-                "group_name": group_name,
-                "op": "change",
-                "new_description": new_description,
-            },
+            {"new_description": new_description},
         )
         self.assert_json_success(result)
         default_stream_groups = get_default_stream_groups(realm)
@@ -2213,7 +3213,7 @@ class DefaultStreamGroupTest(ZulipTestCase):
         do_create_default_stream_group(realm, "group2", "", [])
         result = self.client_patch(
             f"/json/default_stream_groups/{group_id}",
-            {"op": "change", "new_group_name": "group2"},
+            {"new_group_name": "group2"},
         )
         self.assert_json_error(result, "Default stream group 'group2' already exists")
         new_group = lookup_default_stream_groups(["group2"], realm)[0]
@@ -2221,13 +3221,13 @@ class DefaultStreamGroupTest(ZulipTestCase):
 
         result = self.client_patch(
             f"/json/default_stream_groups/{group_id}",
-            {"op": "change", "new_group_name": group_name},
+            {"new_group_name": group_name},
         )
         self.assert_json_error(result, "This default stream group is already named 'group1'")
 
         result = self.client_patch(
             f"/json/default_stream_groups/{group_id}",
-            {"op": "change", "new_group_name": new_group_name},
+            {"new_group_name": new_group_name},
         )
         self.assert_json_success(result)
         default_stream_groups = get_default_stream_groups(realm)
@@ -2251,11 +3251,8 @@ class DefaultStreamGroupTest(ZulipTestCase):
 
         stream_names = ["stream1", "stream2", "stream3"]
         description = "This is group1"
-        streams = []
-
         for stream_name in stream_names:
-            stream = ensure_stream(realm, stream_name, acting_user=None)
-            streams.append(stream)
+            ensure_stream(realm, stream_name, acting_user=None)
 
         result = self.client_post(
             "/json/default_stream_groups/create",
@@ -2494,9 +3491,8 @@ class SubscriptionPropertiesTest(ZulipTestCase):
         )
         self.assertEqual(sub.is_muted, False)
 
-        events: List[Mapping[str, Any]] = []
         property_name = "is_muted"
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             result = self.api_post(
                 test_user,
                 "/api/v1/users/me/subscriptions/properties",
@@ -2515,6 +3511,8 @@ class SubscriptionPropertiesTest(ZulipTestCase):
         self.assert_json_success(result)
         self.assertEqual(events[0]["event"]["property"], "in_home_view")
         self.assertEqual(events[0]["event"]["value"], False)
+        self.assertEqual(events[1]["event"]["property"], "is_muted")
+        self.assertEqual(events[1]["event"]["value"], True)
         sub = Subscription.objects.get(
             recipient__type=Recipient.STREAM,
             recipient__type_id=subs[0]["stream_id"],
@@ -2523,7 +3521,7 @@ class SubscriptionPropertiesTest(ZulipTestCase):
         self.assertEqual(sub.is_muted, True)
 
         legacy_property_name = "in_home_view"
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             result = self.api_post(
                 test_user,
                 "/api/v1/users/me/subscriptions/properties",
@@ -2542,6 +3540,8 @@ class SubscriptionPropertiesTest(ZulipTestCase):
         self.assert_json_success(result)
         self.assertEqual(events[0]["event"]["property"], "in_home_view")
         self.assertEqual(events[0]["event"]["value"], True)
+        self.assertEqual(events[1]["event"]["property"], "is_muted")
+        self.assertEqual(events[1]["event"]["value"], False)
         self.assert_json_success(result)
         sub = Subscription.objects.get(
             recipient__type=Recipient.STREAM,
@@ -2550,7 +3550,7 @@ class SubscriptionPropertiesTest(ZulipTestCase):
         )
         self.assertEqual(sub.is_muted, False)
 
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             result = self.api_post(
                 test_user,
                 "/api/v1/users/me/subscriptions/properties",
@@ -2569,6 +3569,8 @@ class SubscriptionPropertiesTest(ZulipTestCase):
         self.assert_json_success(result)
         self.assertEqual(events[0]["event"]["property"], "in_home_view")
         self.assertEqual(events[0]["event"]["value"], False)
+        self.assertEqual(events[1]["event"]["property"], "is_muted")
+        self.assertEqual(events[1]["event"]["value"], True)
 
         sub = Subscription.objects.get(
             recipient__type=Recipient.STREAM,
@@ -2696,7 +3698,7 @@ class SubscriptionPropertiesTest(ZulipTestCase):
                 ).decode()
             },
         )
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
     def test_set_invalid_property(self) -> None:
         """
@@ -2715,6 +3717,37 @@ class SubscriptionPropertiesTest(ZulipTestCase):
             },
         )
         self.assert_json_error(result, "Unknown subscription property: bad")
+
+    def test_ignored_parameters_in_subscriptions_properties_endpoint(self) -> None:
+        """
+        Sending an invalid parameter with a valid parameter returns
+        an `ignored_parameters_unsupported` array.
+        """
+        test_user = self.example_user("hamlet")
+        self.login_user(test_user)
+
+        subs = gather_subscriptions(test_user)[0]
+        sub = subs[0]
+        result = self.api_post(
+            test_user,
+            "/api/v1/users/me/subscriptions/properties",
+            {
+                "subscription_data": orjson.dumps(
+                    [
+                        {
+                            "property": "wildcard_mentions_notify",
+                            "stream_id": sub["stream_id"],
+                            "value": True,
+                        }
+                    ]
+                ).decode(),
+                "invalid_parameter": orjson.dumps(
+                    [{"property": "pin_to_top", "stream_id": sub["stream_id"], "value": False}]
+                ).decode(),
+            },
+        )
+
+        self.assert_json_success(result, ignored_parameters=["invalid_parameter"])
 
 
 class SubscriptionRestApiTest(ZulipTestCase):
@@ -2803,7 +3836,7 @@ class SubscriptionRestApiTest(ZulipTestCase):
             "/api/v1/users/me/subscriptions/121",
             {"property": "is_muted", "value": "somevalue"},
         )
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
     def test_bad_add_parameters(self) -> None:
         user = self.example_user("hamlet")
@@ -2860,7 +3893,7 @@ class SubscriptionRestApiTest(ZulipTestCase):
             "delete": orjson.dumps([invalid_stream_name]).decode(),
         }
         result = self.api_patch(user, "/api/v1/users/me/subscriptions", request)
-        self.assert_json_error(result, f"Invalid stream name '{invalid_stream_name}'")
+        self.assert_json_error(result, "Stream name can't be empty!")
 
     def test_stream_name_too_long(self) -> None:
         user = self.example_user("hamlet")
@@ -2882,9 +3915,7 @@ class SubscriptionRestApiTest(ZulipTestCase):
             "delete": orjson.dumps([stream_name]).decode(),
         }
         result = self.api_patch(user, "/api/v1/users/me/subscriptions", request)
-        self.assert_json_error(
-            result, f"Stream name '{stream_name}' contains NULL (0x00) characters."
-        )
+        self.assert_json_error(result, "Invalid character in stream name, at position 4!")
 
     def test_compose_views_rollback(self) -> None:
         """
@@ -2898,11 +3929,12 @@ class SubscriptionRestApiTest(ZulipTestCase):
         user_profile = self.example_user("hamlet")
         user_profile.full_name = "Hamlet"
         user_profile.save()
+        request = HostRequestMock(user_profile=user_profile)
 
         def thunk1() -> HttpResponse:
             user_profile.full_name = "Should not be committed"
             user_profile.save()
-            return json_success()
+            return json_success(request)
 
         def thunk2() -> HttpResponse:
             raise JsonableError("random failure")
@@ -2915,6 +3947,7 @@ class SubscriptionRestApiTest(ZulipTestCase):
 
 
 class SubscriptionAPITest(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         """
         All tests will be logged in as hamlet. Also save various useful values
@@ -2932,23 +3965,73 @@ class SubscriptionAPITest(ZulipTestCase):
         """
         Helper function to make up random stream names. It takes
         existing_stream_names and randomly appends a digit to the end of each,
-        but avoids names that appear in the list names_to_avoid.
+        but avoids names of streams already in the realm.
         """
-        random_streams = []
         all_stream_names = [stream.name for stream in Stream.objects.filter(realm=self.test_realm)]
-        for stream in existing_stream_names:
-            random_stream = stream + str(random.randint(0, 9))
-            if random_stream not in all_stream_names:
-                random_streams.append(random_stream)
-        return random_streams
+        return [
+            random_stream
+            for stream in existing_stream_names
+            if (random_stream := stream + str(random.randint(0, 9))) not in all_stream_names
+        ]
+
+    def test_invalid_stream_name(self) -> None:
+        """
+        Creating a stream with invalid 'Cc' and 'Cn' category of unicode characters in stream name
+        """
+        user = self.example_user("hamlet")
+        self.login_user(user)
+
+        # For Cc category
+        post_data_cc = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new\n\rstream", "description": "this is description"}]
+            ).decode(),
+            "invite_only": orjson.dumps(False).decode(),
+        }
+        result = self.api_post(
+            user, "/api/v1/users/me/subscriptions", post_data_cc, subdomain="zulip"
+        )
+        self.assert_json_error(result, "Invalid character in stream name, at position 4!")
+
+        # For Cn category
+        post_data_cn = {
+            "subscriptions": orjson.dumps(
+                [{"name": "new\uFFFEstream", "description": "this is description"}]
+            ).decode(),
+            "invite_only": orjson.dumps(False).decode(),
+        }
+        result = self.api_post(
+            user, "/api/v1/users/me/subscriptions", post_data_cn, subdomain="zulip"
+        )
+        self.assert_json_error(result, "Invalid character in stream name, at position 4!")
+
+    def test_invalid_stream_rename(self) -> None:
+        """
+        Renaming a stream with invalid characters.
+        """
+        user_profile = self.example_user("hamlet")
+        self.login_user(user_profile)
+        stream = self.subscribe(user_profile, "stream_name1")
+        do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
+        # Check for empty name
+        result = self.client_patch(f"/json/streams/{stream.id}", {"new_name": ""})
+        self.assert_json_error(result, "Stream name can't be empty!")
+        # Check for long name
+        result = self.client_patch(f"/json/streams/{stream.id}", {"new_name": "a" * 61})
+        self.assert_json_error(result, "Stream name too long (limit: 60 characters).")
+        # Check for Cc characters
+        result = self.client_patch(f"/json/streams/{stream.id}", {"new_name": "test\n\rname"})
+        self.assert_json_error(result, "Invalid character in stream name, at position 5!")
+        # Check for Cn characters
+        result = self.client_patch(f"/json/streams/{stream.id}", {"new_name": "test\uFFFEame"})
+        self.assert_json_error(result, "Invalid character in stream name, at position 5!")
 
     def test_successful_subscriptions_list(self) -> None:
         """
         Calling /api/v1/users/me/subscriptions should successfully return your subscriptions.
         """
         result = self.api_get(self.test_user, "/api/v1/users/me/subscriptions")
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertIn("subscriptions", json)
         for stream in json["subscriptions"]:
             self.assertIsInstance(stream["name"], str)
@@ -2970,8 +4053,7 @@ class SubscriptionAPITest(ZulipTestCase):
             "/api/v1/users/me/subscriptions",
             {"include_subscribers": "true"},
         )
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertIn("subscriptions", json)
         for stream in json["subscriptions"]:
             self.assertIsInstance(stream["name"], str)
@@ -3012,7 +4094,7 @@ class SubscriptionAPITest(ZulipTestCase):
         result = self.common_subscribe_to_streams(
             self.test_user, subscriptions, other_params, invite_only=invite_only
         )
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertEqual(sorted(subscribed), sorted(json["subscribed"][email]))
         self.assertEqual(sorted(already_subscribed), sorted(json["already_subscribed"][email]))
         user = get_user(email, realm)
@@ -3031,8 +4113,7 @@ class SubscriptionAPITest(ZulipTestCase):
         add_streams = ["Verona2", "Denmark5"]
         self.assertNotEqual(len(add_streams), 0)  # necessary for full test coverage
         # Three events should be sent for each stream for stream creation, subscription add and message notifications.
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=6):
+        with self.capture_send_event_calls(expected_num_events=6):
             self.helper_check_subs_before_and_after_add(
                 self.streams + add_streams,
                 {},
@@ -3054,7 +4135,6 @@ class SubscriptionAPITest(ZulipTestCase):
         self.assertNotEqual(len(self.streams), 0)
         add_streams = ["Verona2", "Denmark5"]
         self.assertNotEqual(len(add_streams), 0)
-        events: List[Mapping[str, Any]] = []
         other_params = {
             "announce": "true",
         }
@@ -3062,7 +4142,7 @@ class SubscriptionAPITest(ZulipTestCase):
         self.test_realm.notifications_stream_id = notifications_stream.id
         self.test_realm.save()
 
-        with self.tornado_redirected_to_list(events, expected_num_events=7):
+        with self.capture_send_event_calls(expected_num_events=7) as events:
             self.helper_check_subs_before_and_after_add(
                 self.streams + add_streams,
                 other_params,
@@ -3119,6 +4199,7 @@ class SubscriptionAPITest(ZulipTestCase):
                 principals=orjson.dumps([self.user_profile.id]).decode(),
             ),
         )
+        target_stream = get_stream(invite_streams[0], self.test_realm)
 
         msg = self.get_second_to_last_message()
         self.assertEqual(msg.recipient.type, Recipient.STREAM)
@@ -3126,6 +4207,16 @@ class SubscriptionAPITest(ZulipTestCase):
         self.assertEqual(msg.sender_id, self.notification_bot(self.test_realm).id)
         expected_msg = (
             f"@_**{invitee_full_name}|{invitee.id}** created a new stream #**{invite_streams[0]}**."
+        )
+        self.assertEqual(msg.content, expected_msg)
+
+        msg = self.get_last_message()
+        self.assertEqual(msg.recipient.type, Recipient.STREAM)
+        self.assertEqual(msg.recipient.type_id, target_stream.id)
+        self.assertEqual(msg.sender_id, self.notification_bot(self.test_realm).id)
+        expected_msg = (
+            f"**Public** stream created by @_**{invitee_full_name}|{invitee.id}**. **Description:**\n"
+            "```` quote\n*No description.*\n````"
         )
         self.assertEqual(msg.content, expected_msg)
 
@@ -3225,9 +4316,7 @@ class SubscriptionAPITest(ZulipTestCase):
         """
         stream_name = "abc\000"
         result = self.common_subscribe_to_streams(self.test_user, [stream_name], allow_fail=True)
-        self.assert_json_error(
-            result, f"Stream name '{stream_name}' contains NULL (0x00) characters."
-        )
+        self.assert_json_error(result, "Invalid character in stream name, at position 4!")
 
     def _test_user_settings_for_creating_streams(
         self,
@@ -3324,30 +4413,20 @@ class SubscriptionAPITest(ZulipTestCase):
             "create_web_public_stream_policy", invite_only=False, is_web_public=True
         )
 
-    def _test_can_create_streams(self, stream_policy: str, invite_only: bool) -> None:
-        if invite_only:
-
-            def validation_func(user_profile: UserProfile) -> bool:
-                user_profile.refresh_from_db()
-                return user_profile.can_create_private_streams()
-
-        else:
-
-            def validation_func(user_profile: UserProfile) -> bool:
-                user_profile.refresh_from_db()
-                return user_profile.can_create_public_streams()
-
-        self.check_has_permission_policies(stream_policy, validation_func)
-
-    def test_can_create_private_streams(self) -> None:
-        self._test_can_create_streams("create_private_stream_policy", invite_only=True)
-
-    def test_can_create_public_streams(self) -> None:
-        self._test_can_create_streams("create_public_stream_policy", invite_only=False)
-
-    def test_can_create_web_public_streams(self) -> None:
+    def test_private_stream_policies(self) -> None:
         def validation_func(user_profile: UserProfile) -> bool:
-            user_profile.refresh_from_db()
+            return user_profile.can_create_private_streams()
+
+        self.check_has_permission_policies("create_private_stream_policy", validation_func)
+
+    def test_public_stream_policies(self) -> None:
+        def validation_func(user_profile: UserProfile) -> bool:
+            return user_profile.can_create_public_streams()
+
+        self.check_has_permission_policies("create_public_stream_policy", validation_func)
+
+    def test_web_public_stream_policies(self) -> None:
+        def validation_func(user_profile: UserProfile) -> bool:
             return user_profile.can_create_web_public_streams()
 
         self.check_has_permission_policies("create_web_public_stream_policy", validation_func)
@@ -3449,7 +4528,6 @@ class SubscriptionAPITest(ZulipTestCase):
         """
 
         def validation_func(user_profile: UserProfile) -> bool:
-            user_profile.refresh_from_db()
             return user_profile.can_subscribe_other_users()
 
         self.check_has_permission_policies("invite_to_stream_policy", validation_func)
@@ -3465,13 +4543,14 @@ class SubscriptionAPITest(ZulipTestCase):
         result = self.common_subscribe_to_streams(
             self.test_user, [invalid_stream_name], allow_fail=True
         )
-        self.assert_json_error(result, f"Invalid stream name '{invalid_stream_name}'")
+        self.assert_json_error(result, "Stream name can't be empty!")
 
     def assert_adding_subscriptions_for_principal(
         self,
         invitee_data: Union[str, int],
         invitee_realm: Realm,
         streams: List[str],
+        policy_name: str,
         invite_only: bool = False,
     ) -> None:
         """
@@ -3507,7 +4586,9 @@ class SubscriptionAPITest(ZulipTestCase):
         self.assertEqual(msg.topic_name(), "stream events")
         self.assertEqual(msg.sender.email, settings.NOTIFICATION_BOT)
         self.assertIn(
-            f"Stream created by @_**{self.test_user.full_name}|{self.test_user.id}**", msg.content
+            f"**{policy_name}** stream created by @_**{self.test_user.full_name}|{self.test_user.id}**. **Description:**\n"
+            "```` quote",
+            msg.content,
         )
 
     def test_multi_user_subscription(self) -> None:
@@ -3515,16 +4596,13 @@ class SubscriptionAPITest(ZulipTestCase):
         user2 = self.example_user("iago")
         realm = get_realm("zulip")
         streams_to_sub = ["multi_user_stream"]
-        events: List[Mapping[str, Any]] = []
-        flush_per_request_caches()
-        with self.tornado_redirected_to_list(events, expected_num_events=5):
-            with queries_captured() as queries:
+        with self.capture_send_event_calls(expected_num_events=5) as events:
+            with self.assert_database_query_count(36):
                 self.common_subscribe_to_streams(
                     self.test_user,
                     streams_to_sub,
                     dict(principals=orjson.dumps([user1.id, user2.id]).decode()),
                 )
-        self.assert_length(queries, 35)
 
         for ev in [x for x in events if x["event"]["type"] not in ("message", "stream")]:
             if ev["event"]["op"] == "add":
@@ -3542,14 +4620,13 @@ class SubscriptionAPITest(ZulipTestCase):
         self.assertEqual(num_subscribers_for_stream_id(stream.id), 2)
 
         # Now add ourselves
-        with self.tornado_redirected_to_list(events, expected_num_events=2):
-            with queries_captured() as queries:
+        with self.capture_send_event_calls(expected_num_events=2) as events:
+            with self.assert_database_query_count(14):
                 self.common_subscribe_to_streams(
                     self.test_user,
                     streams_to_sub,
                     dict(principals=orjson.dumps([self.test_user.id]).decode()),
                 )
-        self.assert_length(queries, 11)
 
         add_event, add_peer_event = events
         self.assertEqual(add_event["event"]["type"], "subscription")
@@ -3561,7 +4638,7 @@ class SubscriptionAPITest(ZulipTestCase):
         )
 
         self.assertNotIn(self.example_user("polonius").id, add_peer_event["users"])
-        self.assert_length(add_peer_event["users"], 12)
+        self.assert_length(add_peer_event["users"], 11)
         self.assertEqual(add_peer_event["event"]["type"], "subscription")
         self.assertEqual(add_peer_event["event"]["op"], "peer_add")
         self.assertEqual(add_peer_event["event"]["user_ids"], [self.user_profile.id])
@@ -3576,7 +4653,7 @@ class SubscriptionAPITest(ZulipTestCase):
         user3 = user_profile
         realm3 = user_profile.realm
         stream = get_stream("multi_user_stream", realm)
-        with self.tornado_redirected_to_list(events, expected_num_events=2):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             bulk_add_subscriptions(realm, [stream], [user_profile], acting_user=None)
 
         add_event, add_peer_event = events
@@ -3592,7 +4669,7 @@ class SubscriptionAPITest(ZulipTestCase):
         # We don't send a peer_add event to othello
         self.assertNotIn(user_profile.id, add_peer_event["users"])
         self.assertNotIn(self.example_user("polonius").id, add_peer_event["users"])
-        self.assert_length(add_peer_event["users"], 12)
+        self.assert_length(add_peer_event["users"], 11)
         self.assertEqual(add_peer_event["event"]["type"], "subscription")
         self.assertEqual(add_peer_event["event"]["op"], "peer_add")
         self.assertEqual(add_peer_event["event"]["user_ids"], [user_profile.id])
@@ -3610,8 +4687,7 @@ class SubscriptionAPITest(ZulipTestCase):
         # Now subscribe Cordelia to the stream, capturing events
         user_profile = self.example_user("cordelia")
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
+        with self.capture_send_event_calls(expected_num_events=3) as events:
             bulk_add_subscriptions(realm, [stream], [user_profile], acting_user=None)
 
         create_event, add_event, add_peer_event = events
@@ -3641,7 +4717,7 @@ class SubscriptionAPITest(ZulipTestCase):
         # even if realm admin is subscribed to stream cause realm admin already get
         # private stream creation event on stream creation.
         new_stream = ensure_stream(realm, "private stream", invite_only=True, acting_user=None)
-        with self.tornado_redirected_to_list(events, expected_num_events=2):
+        with self.capture_send_event_calls(expected_num_events=2) as events:
             bulk_add_subscriptions(
                 realm, [new_stream], [self.example_user("iago")], acting_user=None
             )
@@ -3666,17 +4742,15 @@ class SubscriptionAPITest(ZulipTestCase):
         """
         member = self.example_user("AARON")
         stream = self.make_stream("stream1")
-        do_change_stream_post_policy(stream, Stream.STREAM_POST_POLICY_ADMINS)
+        do_change_stream_post_policy(stream, Stream.STREAM_POST_POLICY_ADMINS, acting_user=member)
         result = self.common_subscribe_to_streams(member, ["stream1"])
-        self.assert_json_success(result)
-
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertEqual(json["subscribed"], {member.email: ["stream1"]})
         self.assertEqual(json["already_subscribed"], {})
 
     def test_subscribe_to_stream_post_policy_restrict_new_members_stream(self) -> None:
         """
-        New members can subscribe to streams where they can not post
+        New members can subscribe to streams where they cannot post
         """
         new_member_email = self.nonreg_email("test")
         self.register(new_member_email, "test")
@@ -3686,11 +4760,11 @@ class SubscriptionAPITest(ZulipTestCase):
         self.assertTrue(new_member.is_provisional_member)
 
         stream = self.make_stream("stream1")
-        do_change_stream_post_policy(stream, Stream.STREAM_POST_POLICY_RESTRICT_NEW_MEMBERS)
+        do_change_stream_post_policy(
+            stream, Stream.STREAM_POST_POLICY_RESTRICT_NEW_MEMBERS, acting_user=new_member
+        )
         result = self.common_subscribe_to_streams(new_member, ["stream1"])
-        self.assert_json_success(result)
-
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertEqual(json["subscribed"], {new_member.email: ["stream1"]})
         self.assertEqual(json["already_subscribed"], {})
 
@@ -3703,11 +4777,11 @@ class SubscriptionAPITest(ZulipTestCase):
         # Make sure that we are testing this with full member which is just below the moderator
         # in the role hierarchy.
         self.assertFalse(member.is_provisional_member)
-        do_change_stream_post_policy(stream, Stream.STREAM_POST_POLICY_MODERATORS)
+        do_change_stream_post_policy(
+            stream, Stream.STREAM_POST_POLICY_MODERATORS, acting_user=member
+        )
         result = self.common_subscribe_to_streams(member, ["stream1"])
-        self.assert_json_success(result)
-
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertEqual(json["subscribed"], {member.email: ["stream1"]})
         self.assertEqual(json["already_subscribed"], {})
 
@@ -3730,7 +4804,7 @@ class SubscriptionAPITest(ZulipTestCase):
         public_stream = self.make_stream("public_stream", invite_only=False)
         private_stream = self.make_stream("private_stream2", invite_only=True)
         # This test should be added as soon as the subscription endpoint allows
-        # guest users to subscribe to web public streams. Although they are already
+        # guest users to subscribe to web-public streams. Although they are already
         # authorized, the decorator in "add_subscriptions_backend" still needs to be
         # deleted.
         #
@@ -3742,6 +4816,34 @@ class SubscriptionAPITest(ZulipTestCase):
             filter_stream_authorization(guest_user, streams_to_sub),
             ([web_public_stream], [public_stream, private_stream]),
         )
+
+        # Guest can be subscribed by other users.
+        normal_user = self.example_user("aaron")
+        with self.capture_send_event_calls(expected_num_events=6) as events:
+            self.common_subscribe_to_streams(
+                self.example_user("hamlet"),
+                ["Denmark"],
+                dict(principals=orjson.dumps([guest_user.id, normal_user.id]).decode()),
+            )
+
+        # Verify that stream creation event is sent to guest user only.
+        stream_create_events = [
+            event
+            for event in events
+            if event["event"]["type"] == "stream" and event["event"]["op"] == "create"
+        ]
+        self.assert_length(stream_create_events, 1)
+        self.assertEqual(stream_create_events[0]["users"], [guest_user.id])
+
+        # Verify that subscription add event is sent to both the users.
+        subscription_add_events = [
+            event
+            for event in events
+            if event["event"]["type"] == "subscription" and event["event"]["op"] == "add"
+        ]
+        self.assert_length(subscription_add_events, 2)
+        self.assertEqual(subscription_add_events[0]["users"], [guest_user.id])
+        self.assertEqual(subscription_add_events[1]["users"], [normal_user.id])
 
     def test_users_getting_add_peer_event(self) -> None:
         """
@@ -3759,8 +4861,7 @@ class SubscriptionAPITest(ZulipTestCase):
         )
 
         new_user_ids_to_subscribe = [iago.id, cordelia.id]
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=5):
+        with self.capture_send_event_calls(expected_num_events=5) as events:
             self.common_subscribe_to_streams(
                 self.test_user,
                 streams_to_sub,
@@ -3778,7 +4879,7 @@ class SubscriptionAPITest(ZulipTestCase):
             # peer_add event recipient list
             self.assertNotIn(user_id, event_sent_to_ids)
         for old_user in orig_user_ids_to_subscribe:
-            # Check non new users are in peer_add event recipient list.
+            # Check non-new users are in peer_add event recipient list.
             self.assertIn(old_user, event_sent_to_ids)
 
     def test_users_getting_remove_peer_event(self) -> None:
@@ -3791,6 +4892,8 @@ class SubscriptionAPITest(ZulipTestCase):
         user4 = self.example_user("iago")
         user5 = self.example_user("AARON")
         guest = self.example_user("polonius")
+
+        realm = user1.realm
 
         stream1 = self.make_stream("stream1")
         stream2 = self.make_stream("stream2")
@@ -3808,23 +4911,24 @@ class SubscriptionAPITest(ZulipTestCase):
         self.subscribe(user2, "private_stream")
         self.subscribe(user3, "private_stream")
 
-        # Apart from 3 peer-remove events and 2 unsubscribe event, because `bulk_remove_subscriptions`
-        # also marks are read messages in those streams as read, so emits 8 `message_flags` events too
-        # (for each of the notification bot messages).
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=13):
-            with queries_captured() as query_count:
-                with cache_tries_captured() as cache_count:
+        # Sends 3 peer-remove events, 2 unsubscribe events
+        # and 2 stream delete events for private streams.
+        with self.assert_database_query_count(16):
+            with self.assert_memcached_count(3):
+                with self.capture_send_event_calls(expected_num_events=7) as events:
                     bulk_remove_subscriptions(
+                        realm,
                         [user1, user2],
                         [stream1, stream2, stream3, private],
                         acting_user=None,
                     )
 
-        self.assert_length(query_count, 27)
-        self.assert_length(cache_count, 3)
-
         peer_events = [e for e in events if e["event"].get("op") == "peer_remove"]
+        stream_delete_events = [
+            e
+            for e in events
+            if e["event"].get("type") == "stream" and e["event"].get("op") == "delete"
+        ]
 
         # We only care about a subset of users when we inspect
         # peer_remove events.
@@ -3856,40 +4960,79 @@ class SubscriptionAPITest(ZulipTestCase):
             ],
         )
 
+        self.assert_length(stream_delete_events, 2)
+        self.assertEqual(stream_delete_events[0]["users"], [user1.id])
+        self.assertEqual(stream_delete_events[1]["users"], [user2.id])
+        for event in stream_delete_events:
+            event_streams = event["event"]["streams"]
+            self.assert_length(event_streams, 1)
+            self.assertEqual(event_streams[0]["name"], "private_stream")
+
     def test_bulk_subscribe_MIT(self) -> None:
         mit_user = self.mit_user("starnine")
+        num_streams = 15
 
         realm = get_realm("zephyr")
-        stream_names = [f"stream_{i}" for i in range(40)]
+        stream_names = [f"stream_{i}" for i in range(num_streams)]
         streams = [self.make_stream(stream_name, realm=realm) for stream_name in stream_names]
 
         for stream in streams:
             stream.is_in_zephyr_realm = True
             stream.save()
 
-        # Make sure Zephyr mirroring realms such as MIT do not get
-        # any tornado subscription events
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=0):
-            with queries_captured() as queries:
+        # Verify that peer_event events are never sent in Zephyr
+        # realm. This does generate stream creation events from
+        # send_stream_creation_events_for_previously_inaccessible_streams.
+        with self.capture_send_event_calls(expected_num_events=num_streams + 1) as events:
+            with self.assert_database_query_count(num_streams + 11):
                 self.common_subscribe_to_streams(
                     mit_user,
                     stream_names,
                     dict(principals=orjson.dumps([mit_user.id]).decode()),
                     subdomain="zephyr",
-                    allow_fail=True,
                 )
-        self.assert_length(queries, 4)
+            # num_streams stream creation events:
+            self.assertEqual(
+                {(event["event"]["type"], event["event"]["op"]) for event in events[0:num_streams]},
+                {("stream", "create")},
+            )
+            # Followed by one subscription event:
+            self.assertEqual(events[num_streams]["event"]["type"], "subscription")
 
-        with self.tornado_redirected_to_list(events, expected_num_events=0):
+        with self.capture_send_event_calls(expected_num_events=2):
             bulk_remove_subscriptions(
+                realm,
                 users=[mit_user],
                 streams=streams,
                 acting_user=None,
             )
 
-    def test_bulk_subscribe_many(self) -> None:
+    def test_subscribe_others_to_public_stream_in_zephyr_realm(self) -> None:
+        """
+        Users cannot be subscribed to public streams by other users in zephyr realm.
+        """
+        starnine = self.mit_user("starnine")
+        espuser = self.mit_user("espuser")
 
+        realm = get_realm("zephyr")
+        stream = self.make_stream("stream_1", realm=realm)
+        stream.is_in_zephyr_realm = True
+        stream.save()
+
+        result = self.common_subscribe_to_streams(
+            starnine,
+            ["stream_1"],
+            dict(principals=orjson.dumps([starnine.id, espuser.id]).decode()),
+            subdomain="zephyr",
+            allow_fail=True,
+        )
+        self.assert_json_error(
+            result,
+            "You can only invite other Zephyr mirroring users to private streams.",
+            status_code=400,
+        )
+
+    def test_bulk_subscribe_many(self) -> None:
         # Create a whole bunch of streams
         streams = [f"stream_{i}" for i in range(30)]
         for stream_name in streams:
@@ -3920,19 +5063,17 @@ class SubscriptionAPITest(ZulipTestCase):
 
         test_user_ids = [user.id for user in test_users]
 
-        with queries_captured() as queries:
-            with cache_tries_captured() as cache_tries:
+        # The only known O(N) behavior here is that we call
+        # principal_to_user_profile for each of our users, but it
+        # should be cached.
+        with self.assert_database_query_count(21):
+            with self.assert_memcached_count(3):
                 with mock.patch("zerver.views.streams.send_messages_for_new_subscribers"):
                     self.common_subscribe_to_streams(
                         desdemona,
                         streams,
                         dict(principals=orjson.dumps(test_user_ids).decode()),
                     )
-
-        # The only known O(N) behavior here is that we call
-        # principal_to_user_profile for each of our users.
-        self.assert_length(queries, 18)
-        self.assert_length(cache_tries, 4)
 
     def test_subscriptions_add_for_principal(self) -> None:
         """
@@ -3941,13 +5082,17 @@ class SubscriptionAPITest(ZulipTestCase):
         invitee = self.example_user("iago")
         current_streams = self.get_streams(invitee)
         invite_streams = self.make_random_stream_names(current_streams)
-        self.assert_adding_subscriptions_for_principal(invitee.id, invitee.realm, invite_streams)
+        self.assert_adding_subscriptions_for_principal(
+            invitee.id, invitee.realm, invite_streams, policy_name="Public"
+        )
 
     def test_subscriptions_add_for_principal_legacy_emails(self) -> None:
         invitee = self.example_user("iago")
         current_streams = self.get_streams(invitee)
         invite_streams = self.make_random_stream_names(current_streams)
-        self.assert_adding_subscriptions_for_principal(invitee.email, invitee.realm, invite_streams)
+        self.assert_adding_subscriptions_for_principal(
+            invitee.email, invitee.realm, invite_streams, policy_name="Public"
+        )
 
     def test_subscriptions_add_for_principal_deactivated(self) -> None:
         """
@@ -3963,11 +5108,7 @@ class SubscriptionAPITest(ZulipTestCase):
         result = self.common_subscribe_to_streams(
             self.test_user, "Denmark", post_data, allow_fail=True
         )
-        self.assert_json_error(
-            result,
-            f"User not authorized to execute queries on behalf of '{target_profile.id}'",
-            status_code=403,
-        )
+        self.assert_json_error(result, "User is deactivated", status_code=400)
 
     def test_subscriptions_add_for_principal_invite_only(self) -> None:
         """
@@ -3977,7 +5118,11 @@ class SubscriptionAPITest(ZulipTestCase):
         current_streams = self.get_streams(invitee)
         invite_streams = self.make_random_stream_names(current_streams)
         self.assert_adding_subscriptions_for_principal(
-            invitee.id, invitee.realm, invite_streams, invite_only=True
+            invitee.id,
+            invitee.realm,
+            invite_streams,
+            invite_only=True,
+            policy_name="Private, protected history",
         )
 
     def test_non_ascii_subscription_for_principal(self) -> None:
@@ -3986,7 +5131,9 @@ class SubscriptionAPITest(ZulipTestCase):
         non-ASCII characters.
         """
         iago = self.example_user("iago")
-        self.assert_adding_subscriptions_for_principal(iago.id, get_realm("zulip"), ["hümbüǵ"])
+        self.assert_adding_subscriptions_for_principal(
+            iago.id, get_realm("zulip"), ["hümbüǵ"], policy_name="Public"
+        )
 
     def test_subscription_add_invalid_principal_legacy_emails(self) -> None:
         """
@@ -4004,11 +5151,7 @@ class SubscriptionAPITest(ZulipTestCase):
             {"principals": orjson.dumps([invalid_principal]).decode()},
             allow_fail=True,
         )
-        self.assert_json_error(
-            result,
-            f"User not authorized to execute queries on behalf of '{invalid_principal}'",
-            status_code=403,
-        )
+        self.assert_json_error(result, "No such user", status_code=400)
 
     def test_subscription_add_invalid_principal(self) -> None:
         invalid_principal = 999
@@ -4021,11 +5164,7 @@ class SubscriptionAPITest(ZulipTestCase):
             {"principals": orjson.dumps([invalid_principal]).decode()},
             allow_fail=True,
         )
-        self.assert_json_error(
-            result,
-            f"User not authorized to execute queries on behalf of '{invalid_principal}'",
-            status_code=403,
-        )
+        self.assert_json_error(result, "No such user", status_code=400)
 
     def test_subscription_add_principal_other_realm(self) -> None:
         """
@@ -4042,11 +5181,7 @@ class SubscriptionAPITest(ZulipTestCase):
             {"principals": orjson.dumps([principal]).decode()},
             allow_fail=True,
         )
-        self.assert_json_error(
-            result,
-            f"User not authorized to execute queries on behalf of '{principal}'",
-            status_code=403,
-        )
+        self.assert_json_error(result, "No such user", status_code=400)
 
     def helper_check_subs_before_and_after_remove(
         self,
@@ -4069,8 +5204,7 @@ class SubscriptionAPITest(ZulipTestCase):
         result = self.client_delete(
             "/json/users/me/subscriptions", {"subscriptions": orjson.dumps(subscriptions).decode()}
         )
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
         for key, val in json_dict.items():
             # we don't care about the order of the items
             self.assertEqual(sorted(val), sorted(json[key]))
@@ -4087,10 +5221,11 @@ class SubscriptionAPITest(ZulipTestCase):
         """
         self.assertGreaterEqual(len(self.streams), 2)
         streams_to_remove = self.streams[1:]
-        not_subbed = []
-        for stream in Stream.objects.filter(realm=get_realm("zulip")):
-            if stream.name not in self.streams:
-                not_subbed.append(stream.name)
+        not_subbed = [
+            stream.name
+            for stream in Stream.objects.filter(realm=get_realm("zulip"))
+            if stream.name not in self.streams
+        ]
         random.shuffle(not_subbed)
         self.assertNotEqual(len(not_subbed), 0)  # necessary for full test coverage
         try_to_remove = not_subbed[:3]  # attempt to remove up to 3 streams not already subbed to
@@ -4125,11 +5260,11 @@ class SubscriptionAPITest(ZulipTestCase):
         Call /json/subscriptions/exists on a stream and expect a certain result.
         """
         result = self.client_post("/json/subscriptions/exists", {"stream": stream})
-        json = result.json()
         if expect_success:
-            self.assert_json_success(result)
+            json = self.assert_json_success(result)
         else:
             self.assertEqual(result.status_code, 404)
+            json = result.json()
         if subscribed:
             self.assertIn("subscribed", json)
             self.assertEqual(json["subscribed"], subscribed)
@@ -4170,7 +5305,7 @@ class SubscriptionAPITest(ZulipTestCase):
         # currently, the only invalid stream name is the empty string
         invalid_stream_name = ""
         result = self.client_post("/json/subscriptions/exists", {"stream": invalid_stream_name})
-        self.assert_json_error(result, "Invalid stream name ''")
+        self.assert_json_error(result, "Stream name can't be empty!")
 
     def test_existing_subscriptions_autosubscription(self) -> None:
         """
@@ -4182,16 +5317,16 @@ class SubscriptionAPITest(ZulipTestCase):
         result = self.client_post(
             "/json/subscriptions/exists", {"stream": stream_name, "autosubscribe": "false"}
         )
-        self.assert_json_success(result)
-        self.assertIn("subscribed", result.json())
-        self.assertFalse(result.json()["subscribed"])
+        response_dict = self.assert_json_success(result)
+        self.assertIn("subscribed", response_dict)
+        self.assertFalse(response_dict["subscribed"])
 
         result = self.client_post(
             "/json/subscriptions/exists", {"stream": stream_name, "autosubscribe": "true"}
         )
-        self.assert_json_success(result)
-        self.assertIn("subscribed", result.json())
-        self.assertTrue(result.json()["subscribed"])
+        response_dict = self.assert_json_success(result)
+        self.assertIn("subscribed", response_dict)
+        self.assertTrue(response_dict)
 
     def test_existing_subscriptions_autosubscription_private_stream(self) -> None:
         """Call /json/subscriptions/exist on an existing private stream with
@@ -4215,9 +5350,9 @@ class SubscriptionAPITest(ZulipTestCase):
         result = self.client_post(
             "/json/subscriptions/exists", {"stream": stream_name, "autosubscribe": "false"}
         )
-        self.assert_json_success(result)
-        self.assertIn("subscribed", result.json())
-        self.assertTrue(result.json()["subscribed"])
+        response_dict = self.assert_json_success(result)
+        self.assertIn("subscribed", response_dict)
+        self.assertTrue(response_dict)
 
     def get_subscription(self, user_profile: UserProfile, stream_name: str) -> Subscription:
         stream = get_stream(stream_name, self.test_realm)
@@ -4244,15 +5379,15 @@ class SubscriptionAPITest(ZulipTestCase):
         current_stream = self.get_streams(user_profile)[0]
         invite_streams = self.make_random_stream_names([current_stream])
         self.assert_adding_subscriptions_for_principal(
-            invitee_user_id, invitee_realm, invite_streams
+            invitee_user_id, invitee_realm, invite_streams, policy_name="Public"
         )
         subscription = self.get_subscription(user_profile, invite_streams[0])
 
-        with mock.patch("zerver.models.Recipient.__str__", return_value="recip"):
+        with mock.patch("zerver.models.Recipient.__repr__", return_value="recip"):
             self.assertEqual(
-                str(subscription),
+                repr(subscription),
                 "<Subscription: "
-                f"<UserProfile: {user_profile.email} {user_profile.realm}> -> recip>",
+                f"<UserProfile: {user_profile.email} {user_profile.realm!r}> -> recip>",
             )
 
         self.assertIsNone(subscription.desktop_notifications)
@@ -4279,7 +5414,7 @@ class SubscriptionAPITest(ZulipTestCase):
         self.send_stream_message(random_user, "stream2", "test", "test")
         self.send_stream_message(random_user, "private_stream", "test", "test")
 
-        def get_unread_stream_data() -> List[Dict[str, Any]]:
+        def get_unread_stream_data() -> List[UnreadStreamInfo]:
             raw_unread_data = get_raw_unread_data(user)
             aggregated_data = aggregate_unread_data(raw_unread_data)
             return aggregated_data["streams"]
@@ -4290,9 +5425,10 @@ class SubscriptionAPITest(ZulipTestCase):
         self.assertEqual(result[1]["stream_id"], stream2.id)
         self.assertEqual(result[2]["stream_id"], private.id)
 
-        # Unsubscribing should mark all the messages in stream2 as read
-        self.unsubscribe(user, "stream2")
-        self.unsubscribe(user, "private_stream")
+        with self.captureOnCommitCallbacks(execute=True):
+            # Unsubscribing should mark all the messages in stream2 as read
+            self.unsubscribe(user, "stream2")
+            self.unsubscribe(user, "private_stream")
 
         self.subscribe(user, "stream2")
         self.subscribe(user, "private_stream")
@@ -4386,29 +5522,27 @@ class SubscriptionAPITest(ZulipTestCase):
         ]
 
         # Test creating a public stream when realm does not have a notification stream.
-        with queries_captured() as queries:
+        with self.assert_database_query_count(36):
             self.common_subscribe_to_streams(
                 self.test_user,
                 [new_streams[0]],
                 dict(principals=orjson.dumps([user1.id, user2.id]).decode()),
             )
-        self.assert_length(queries, 35)
 
         # Test creating private stream.
-        with queries_captured() as queries:
+        with self.assert_database_query_count(38):
             self.common_subscribe_to_streams(
                 self.test_user,
                 [new_streams[1]],
                 dict(principals=orjson.dumps([user1.id, user2.id]).decode()),
                 invite_only=True,
             )
-        self.assert_length(queries, 34)
 
         # Test creating a public stream with announce when realm has a notification stream.
         notifications_stream = get_stream(self.streams[0], self.test_realm)
         self.test_realm.notifications_stream_id = notifications_stream.id
         self.test_realm.save()
-        with queries_captured() as queries:
+        with self.assert_database_query_count(47):
             self.common_subscribe_to_streams(
                 self.test_user,
                 [new_streams[2]],
@@ -4417,7 +5551,6 @@ class SubscriptionAPITest(ZulipTestCase):
                     principals=orjson.dumps([user1.id, user2.id]).decode(),
                 ),
             )
-        self.assert_length(queries, 43)
 
 
 class GetStreamsTest(ZulipTestCase):
@@ -4438,8 +5571,7 @@ class GetStreamsTest(ZulipTestCase):
         result = self.api_get(test_bot, "/api/v1/streams", filters)
         owner_subs = self.api_get(hamlet, "/api/v1/users/me/subscriptions")
 
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertIn("streams", json)
         self.assertIsInstance(json["streams"], list)
 
@@ -4461,8 +5593,7 @@ class GetStreamsTest(ZulipTestCase):
         )
         result = self.api_get(test_bot, "/api/v1/streams", filters)
 
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertIn("streams", json)
         self.assertIsInstance(json["streams"], list)
 
@@ -4486,8 +5617,7 @@ class GetStreamsTest(ZulipTestCase):
             },
         )
 
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertIn("streams", json)
         self.assertIsInstance(json["streams"], list)
 
@@ -4510,8 +5640,7 @@ class GetStreamsTest(ZulipTestCase):
             },
         )
 
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertIn("streams", json)
         self.assertIsInstance(json["streams"], list)
 
@@ -4536,8 +5665,7 @@ class GetStreamsTest(ZulipTestCase):
         self.assertTrue(admin_user.is_realm_admin)
 
         result = self.api_get(admin_user, url, data)
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
 
         self.assertIn("streams", json)
         self.assertIsInstance(json["streams"], list)
@@ -4562,8 +5690,7 @@ class GetStreamsTest(ZulipTestCase):
         result = self.api_get(user, "/api/v1/streams", {"include_public": "false"})
         result2 = self.api_get(user, "/api/v1/users/me/subscriptions")
 
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
 
         self.assertIn("streams", json)
 
@@ -4580,13 +5707,90 @@ class GetStreamsTest(ZulipTestCase):
         # Check it correctly lists all public streams with include_subscribed=false
         filters = dict(include_public="true", include_subscribed="false")
         result = self.api_get(user, "/api/v1/streams", filters)
-        self.assert_json_success(result)
-
-        json = result.json()
+        json = self.assert_json_success(result)
         all_streams = [
             stream.name for stream in Stream.objects.filter(realm=realm, invite_only=False)
         ]
         self.assertEqual(sorted(s["name"] for s in json["streams"]), sorted(all_streams))
+
+    def test_get_single_stream_api(self) -> None:
+        self.login("hamlet")
+        realm = get_realm("zulip")
+        denmark_stream = get_stream("Denmark", realm)
+        result = self.client_get(f"/json/streams/{denmark_stream.id}")
+        json = self.assert_json_success(result)
+        self.assertEqual(json["stream"]["name"], "Denmark")
+        self.assertEqual(json["stream"]["stream_id"], denmark_stream.id)
+
+        result = self.client_get("/json/streams/9999")
+        self.assert_json_error(result, "Invalid stream ID")
+
+        private_stream = self.make_stream("private_stream", invite_only=True)
+        self.subscribe(self.example_user("cordelia"), "private_stream")
+
+        # Non-admins cannot access unsubscribed private streams.
+        result = self.client_get(f"/json/streams/{private_stream.id}")
+        self.assert_json_error(result, "Invalid stream ID")
+
+        self.login("iago")
+        result = self.client_get(f"/json/streams/{private_stream.id}")
+        json = self.assert_json_success(result)
+        self.assertEqual(json["stream"]["name"], "private_stream")
+        self.assertEqual(json["stream"]["stream_id"], private_stream.id)
+
+        self.login("cordelia")
+        result = self.client_get(f"/json/streams/{private_stream.id}")
+        json = self.assert_json_success(result)
+        self.assertEqual(json["stream"]["name"], "private_stream")
+        self.assertEqual(json["stream"]["stream_id"], private_stream.id)
+
+    def test_get_stream_email_address(self) -> None:
+        self.login("hamlet")
+        hamlet = self.example_user("hamlet")
+        iago = self.example_user("iago")
+        polonius = self.example_user("polonius")
+        realm = get_realm("zulip")
+        denmark_stream = get_stream("Denmark", realm)
+        result = self.client_get(f"/json/streams/{denmark_stream.id}/email_address")
+        json = self.assert_json_success(result)
+        denmark_email = encode_email_address_helper(
+            denmark_stream.name, denmark_stream.email_token, show_sender=True
+        )
+        self.assertEqual(json["email"], denmark_email)
+
+        self.login("polonius")
+        result = self.client_get(f"/json/streams/{denmark_stream.id}/email_address")
+        self.assert_json_error(result, "Invalid stream ID")
+
+        self.subscribe(polonius, "Denmark")
+        result = self.client_get(f"/json/streams/{denmark_stream.id}/email_address")
+        json = self.assert_json_success(result)
+        self.assertEqual(json["email"], denmark_email)
+
+        do_change_stream_permission(
+            denmark_stream,
+            invite_only=True,
+            history_public_to_subscribers=True,
+            is_web_public=False,
+            acting_user=iago,
+        )
+        self.login("hamlet")
+        result = self.client_get(f"/json/streams/{denmark_stream.id}/email_address")
+        json = self.assert_json_success(result)
+        self.assertEqual(json["email"], denmark_email)
+
+        self.unsubscribe(hamlet, "Denmark")
+        result = self.client_get(f"/json/streams/{denmark_stream.id}/email_address")
+        self.assert_json_error(result, "Invalid stream ID")
+
+        self.login("iago")
+        result = self.client_get(f"/json/streams/{denmark_stream.id}/email_address")
+        json = self.assert_json_success(result)
+        self.assertEqual(json["email"], denmark_email)
+
+        self.unsubscribe(iago, "Denmark")
+        result = self.client_get(f"/json/streams/{denmark_stream.id}/email_address")
+        self.assert_json_error(result, "Invalid stream ID")
 
 
 class StreamIdTest(ZulipTestCase):
@@ -4595,8 +5799,8 @@ class StreamIdTest(ZulipTestCase):
         self.login_user(user)
         stream = gather_subscriptions(user)[0][0]
         result = self.client_get("/json/get_stream_id", {"stream": stream["name"]})
-        self.assert_json_success(result)
-        self.assertEqual(result.json()["stream_id"], stream["stream_id"])
+        response_dict = self.assert_json_success(result)
+        self.assertEqual(response_dict["stream_id"], stream["stream_id"])
 
     def test_get_stream_id_wrong_name(self) -> None:
         user = self.example_user("hamlet")
@@ -4634,9 +5838,9 @@ class InviteOnlyStreamTest(ZulipTestCase):
         self.common_subscribe_to_streams(user, ["Saxony"], invite_only=True)
         self.common_subscribe_to_streams(user, ["Normandy"], invite_only=False)
         result = self.api_get(user, "/api/v1/users/me/subscriptions")
-        self.assert_json_success(result)
-        self.assertIn("subscriptions", result.json())
-        for sub in result.json()["subscriptions"]:
+        response_dict = self.assert_json_success(result)
+        self.assertIn("subscriptions", response_dict)
+        for sub in response_dict["subscriptions"]:
             if sub["name"] == "Normandy":
                 self.assertEqual(
                     sub["invite_only"], False, "Normandy was mistakenly marked private"
@@ -4653,7 +5857,7 @@ class InviteOnlyStreamTest(ZulipTestCase):
 
         result = self.common_subscribe_to_streams(hamlet, [stream_name], invite_only=True)
 
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertEqual(json["subscribed"], {hamlet.email: [stream_name]})
         self.assertEqual(json["already_subscribed"], {})
 
@@ -4669,7 +5873,7 @@ class InviteOnlyStreamTest(ZulipTestCase):
             [stream_name],
             extra_post_data={"authorization_errors_fatal": orjson.dumps(False).decode()},
         )
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertEqual(json["unauthorized"], [stream_name])
         self.assertEqual(json["subscribed"], {})
         self.assertEqual(json["already_subscribed"], {})
@@ -4681,29 +5885,63 @@ class InviteOnlyStreamTest(ZulipTestCase):
             [stream_name],
             extra_post_data={"principals": orjson.dumps([othello.id]).decode()},
         )
-        json = result.json()
+        json = self.assert_json_success(result)
         self.assertEqual(json["subscribed"], {othello.email: [stream_name]})
         self.assertEqual(json["already_subscribed"], {})
 
         # Make sure both users are subscribed to this stream
         stream_id = get_stream(stream_name, hamlet.realm).id
         result = self.api_get(hamlet, f"/api/v1/streams/{stream_id}/members")
-        self.assert_json_success(result)
-        json = result.json()
+        json = self.assert_json_success(result)
 
         self.assertTrue(othello.id in json["subscribers"])
         self.assertTrue(hamlet.id in json["subscribers"])
 
 
 class GetSubscribersTest(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("hamlet")
         self.login_user(self.user_profile)
 
-    def assert_user_got_subscription_notification(self, expected_msg: str, realm: Realm) -> None:
+    def verify_sub_fields(self, sub_data: SubscriptionInfo) -> None:
+        other_fields = {
+            "is_announcement_only",
+            "in_home_view",
+            "stream_id",
+            "stream_weekly_traffic",
+            "subscribers",
+        }
+
+        expected_fields = set(Stream.API_FIELDS) | set(Subscription.API_FIELDS) | other_fields
+        expected_fields -= {"id", "can_remove_subscribers_group_id"}
+        expected_fields |= {"can_remove_subscribers_group"}
+
+        for lst in [sub_data.subscriptions, sub_data.unsubscribed]:
+            for sub in lst:
+                self.assertEqual(set(sub), expected_fields)
+
+        other_fields = {
+            "is_announcement_only",
+            "stream_id",
+            "stream_weekly_traffic",
+            "subscribers",
+        }
+
+        expected_fields = set(Stream.API_FIELDS) | other_fields
+        expected_fields -= {"id", "can_remove_subscribers_group_id"}
+        expected_fields |= {"can_remove_subscribers_group"}
+
+        for never_sub in sub_data.never_subscribed:
+            self.assertEqual(set(never_sub), expected_fields)
+
+    def assert_user_got_subscription_notification(
+        self, user: UserProfile, expected_msg: str
+    ) -> None:
         # verify that the user was sent a message informing them about the subscription
-        msg = self.get_last_message()
+        realm = user.realm
+        msg = most_recent_message(user)
         self.assertEqual(msg.recipient.type, msg.recipient.PERSONAL)
         self.assertEqual(msg.sender_id, self.notification_bot(realm).id)
 
@@ -4732,7 +5970,7 @@ class GetSubscribersTest(ZulipTestCase):
 
     def make_subscriber_request(
         self, stream_id: int, user: Optional[UserProfile] = None
-    ) -> HttpResponse:
+    ) -> "TestHttpResponse":
         if user is None:
             user = self.user_profile
         return self.api_get(user, f"/api/v1/streams/{stream_id}/members")
@@ -4740,8 +5978,8 @@ class GetSubscribersTest(ZulipTestCase):
     def make_successful_subscriber_request(self, stream_name: str) -> None:
         stream_id = get_stream(stream_name, self.user_profile.realm).id
         result = self.make_subscriber_request(stream_id)
-        self.assert_json_success(result)
-        self.check_well_formed_result(result.json(), stream_name, self.user_profile.realm)
+        response_dict = self.assert_json_success(result)
+        self.check_well_formed_result(response_dict, stream_name, self.user_profile.realm)
 
     def test_subscriber(self) -> None:
         """
@@ -4757,21 +5995,31 @@ class GetSubscribersTest(ZulipTestCase):
         (We also use this test to verify subscription notifications to
         folks who get subscribed to streams.)
         """
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+        othello = self.example_user("othello")
+        polonius = self.example_user("polonius")
+
         streams = [f"stream_{i}" for i in range(10)]
         for stream_name in streams:
             self.make_stream(stream_name)
 
         users_to_subscribe = [
             self.user_profile.id,
-            self.example_user("othello").id,
-            self.example_user("cordelia").id,
+            othello.id,
+            cordelia.id,
+            polonius.id,
         ]
-        self.common_subscribe_to_streams(
-            self.user_profile, streams, dict(principals=orjson.dumps(users_to_subscribe).decode())
-        )
 
-        msg = """
-            @**King Hamlet** subscribed you to the following streams:
+        with self.assert_database_query_count(46):
+            self.common_subscribe_to_streams(
+                self.user_profile,
+                streams,
+                dict(principals=orjson.dumps(users_to_subscribe).decode()),
+            )
+
+        msg = f"""
+            @**King Hamlet|{hamlet.id}** subscribed you to the following streams:
 
             * #**stream_0**
             * #**stream_1**
@@ -4785,7 +6033,8 @@ class GetSubscribersTest(ZulipTestCase):
             * #**stream_9**
             """
 
-        self.assert_user_got_subscription_notification(msg, self.user_profile.realm)
+        for user in [cordelia, othello, polonius]:
+            self.assert_user_got_subscription_notification(user, msg)
 
         # Subscribe ourself first.
         self.common_subscribe_to_streams(
@@ -4804,12 +6053,13 @@ class GetSubscribersTest(ZulipTestCase):
             invite_only=True,
         )
 
-        msg = """
-            @**King Hamlet** subscribed you to the stream #**stream_invite_only_1**.
+        msg = f"""
+            @**King Hamlet|{hamlet.id}** subscribed you to the stream #**stream_invite_only_1**.
             """
-        self.assert_user_got_subscription_notification(msg, self.user_profile.realm)
+        for user in [cordelia, othello, polonius]:
+            self.assert_user_got_subscription_notification(user, msg)
 
-        with queries_captured() as queries:
+        with self.assert_database_query_count(4):
             subscribed_streams, _ = gather_subscriptions(
                 self.user_profile, include_subscribers=True
             )
@@ -4818,7 +6068,6 @@ class GetSubscribersTest(ZulipTestCase):
             if not sub["name"].startswith("stream_"):
                 continue
             self.assert_length(sub["subscribers"], len(users_to_subscribe))
-        self.assert_length(queries, 4)
 
     def test_never_subscribed_streams(self) -> None:
         """
@@ -4884,11 +6133,11 @@ class GetSubscribersTest(ZulipTestCase):
 
         create_private_streams()
 
-        def get_never_subscribed() -> List[Dict[str, Any]]:
-            with queries_captured() as queries:
+        def get_never_subscribed() -> List[NeverSubscribedStreamDict]:
+            with self.assert_database_query_count(4):
                 sub_data = gather_subscriptions_helper(self.user_profile)
+                self.verify_sub_fields(sub_data)
             never_subscribed = sub_data.never_subscribed
-            self.assert_length(queries, 4)
 
             # Ignore old streams.
             never_subscribed = [dct for dct in never_subscribed if dct["name"].startswith("test_")]
@@ -4921,14 +6170,15 @@ class GetSubscribersTest(ZulipTestCase):
         def test_guest_user_case() -> None:
             self.user_profile.role = UserProfile.ROLE_GUEST
             helper_result = gather_subscriptions_helper(self.user_profile)
+            self.verify_sub_fields(helper_result)
             sub = helper_result.subscriptions
             unsub = helper_result.unsubscribed
             never_sub = helper_result.never_subscribed
 
             # It's +1 because of the stream Rome.
             self.assert_length(never_sub, len(web_public_streams) + 1)
-            sub_ids = list(map(lambda stream: stream["stream_id"], sub))
-            unsub_ids = list(map(lambda stream: stream["stream_id"], unsub))
+            sub_ids = [stream["stream_id"] for stream in sub]
+            unsub_ids = [stream["stream_id"] for stream in unsub]
 
             for stream_dict in never_sub:
                 self.assertTrue(stream_dict["is_web_public"])
@@ -4964,6 +6214,7 @@ class GetSubscribersTest(ZulipTestCase):
         self.subscribe(normal_user, stream_name_unsub)
 
         helper_result = gather_subscriptions_helper(guest_user)
+        self.verify_sub_fields(helper_result)
         subs = helper_result.subscriptions
         neversubs = helper_result.never_subscribed
 
@@ -4983,6 +6234,14 @@ class GetSubscribersTest(ZulipTestCase):
         # Guest user only get data about never subscribed web-public streams
         self.assert_length(neversubs, 1)
 
+    def test_api_fields_present(self) -> None:
+        user = self.example_user("cordelia")
+
+        sub_data = gather_subscriptions_helper(user)
+        subscribed = sub_data.subscriptions
+        self.assertGreaterEqual(len(subscribed), 1)
+        self.verify_sub_fields(sub_data)
+
     def test_previously_subscribed_private_streams(self) -> None:
         admin_user = self.example_user("iago")
         non_admin_user = self.example_user("cordelia")
@@ -5001,20 +6260,56 @@ class GetSubscribersTest(ZulipTestCase):
 
         # Test admin user gets previously subscribed private stream's subscribers.
         sub_data = gather_subscriptions_helper(admin_user)
+        self.verify_sub_fields(sub_data)
         unsubscribed_streams = sub_data.unsubscribed
         self.assert_length(unsubscribed_streams, 1)
         self.assert_length(unsubscribed_streams[0]["subscribers"], 1)
 
-        # Test non admin users cannot get previously subscribed private stream's subscribers.
+        # Test non-admin users cannot get previously subscribed private stream's subscribers.
         sub_data = gather_subscriptions_helper(non_admin_user)
+        self.verify_sub_fields(sub_data)
         unsubscribed_streams = sub_data.unsubscribed
-        self.assert_length(unsubscribed_streams, 1)
-        self.assertEqual(unsubscribed_streams[0]["subscribers"], [])
+        self.assert_length(unsubscribed_streams, 0)
 
         sub_data = gather_subscriptions_helper(guest_user)
+        self.verify_sub_fields(sub_data)
+        unsubscribed_streams = sub_data.unsubscribed
+        self.assert_length(unsubscribed_streams, 0)
+
+    def test_previously_subscribed_public_streams(self) -> None:
+        public_stream_name = "public_stream"
+        web_public_stream_name = "web_public_stream"
+        guest_user = self.example_user("polonius")
+        member_user = self.example_user("hamlet")
+
+        self.make_stream(public_stream_name, realm=get_realm("zulip"))
+        self.make_stream(web_public_stream_name, realm=get_realm("zulip"), is_web_public=True)
+
+        for stream_name in [public_stream_name, web_public_stream_name]:
+            self.subscribe(guest_user, stream_name)
+            self.subscribe(member_user, stream_name)
+            self.subscribe(self.example_user("othello"), stream_name)
+
+        for stream_name in [public_stream_name, web_public_stream_name]:
+            self.unsubscribe(guest_user, stream_name)
+            self.unsubscribe(member_user, stream_name)
+
+        # Test member user gets previously subscribed public stream and its subscribers.
+        sub_data = gather_subscriptions_helper(member_user)
+        self.verify_sub_fields(sub_data)
+        unsubscribed_streams = sub_data.unsubscribed
+        self.assert_length(unsubscribed_streams, 2)
+        self.assert_length(unsubscribed_streams[0]["subscribers"], 1)
+        self.assert_length(unsubscribed_streams[1]["subscribers"], 1)
+
+        # Test guest users cannot get previously subscribed public stream but can get
+        # web-public stream and its subscribers.
+        sub_data = gather_subscriptions_helper(guest_user)
+        self.verify_sub_fields(sub_data)
         unsubscribed_streams = sub_data.unsubscribed
         self.assert_length(unsubscribed_streams, 1)
-        self.assertEqual(unsubscribed_streams[0]["subscribers"], [])
+        self.assertEqual(unsubscribed_streams[0]["is_web_public"], True)
+        self.assert_length(unsubscribed_streams[0]["subscribers"], 1)
 
     def test_gather_subscriptions_mit(self) -> None:
         """
@@ -5036,7 +6331,7 @@ class GetSubscribersTest(ZulipTestCase):
             subdomain="zephyr",
         )
 
-        with queries_captured() as queries:
+        with self.assert_database_query_count(3):
             subscribed_streams, _ = gather_subscriptions(mit_user_profile, include_subscribers=True)
 
         self.assertGreaterEqual(len(subscribed_streams), 2)
@@ -5047,7 +6342,19 @@ class GetSubscribersTest(ZulipTestCase):
                 self.assert_length(sub["subscribers"], len(users_to_subscribe))
             else:
                 self.assert_length(sub["subscribers"], 0)
-        self.assert_length(queries, 4)
+            self.assertIsNone(sub["stream_weekly_traffic"])
+
+        # Create a web-public stream to test never_subscried data.
+        self.make_stream("mit_stream_2", realm=mit_user_profile.realm, is_web_public=True)
+        self.make_stream("mit_stream_3", realm=mit_user_profile.realm)
+
+        sub_info = gather_subscriptions_helper(mit_user_profile, include_subscribers=True)
+        never_subscribed_streams = sub_info.never_subscribed
+        # Users in zephyr mirror realm can only access web-public never subscribed streams.
+        self.assert_length(never_subscribed_streams, 1)
+        self.assertEqual(never_subscribed_streams[0]["name"], "mit_stream_2")
+        self.assertTrue(never_subscribed_streams[0]["is_web_public"])
+        self.assertIsNone(never_subscribed_streams[0]["stream_weekly_traffic"])
 
     def test_nonsubscriber(self) -> None:
         """
@@ -5075,7 +6382,7 @@ class GetSubscribersTest(ZulipTestCase):
         # Verify another user can't get the data.
         self.login("cordelia")
         result = self.client_get(f"/json/streams/{stream_id}/members")
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         # But an organization administrator can
         self.login("iago")
@@ -5088,7 +6395,7 @@ class GetSubscribersTest(ZulipTestCase):
         """
         stream_id = 99999999
         result = self.client_get(f"/json/streams/{stream_id}/members")
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
     def test_json_get_subscribers(self) -> None:
         """
@@ -5101,8 +6408,7 @@ class GetSubscribersTest(ZulipTestCase):
             0
         ]["subscribers"]
         result = self.client_get(f"/json/streams/{stream_id}/members")
-        self.assert_json_success(result)
-        result_dict = result.json()
+        result_dict = self.assert_json_success(result)
         self.assertIn("subscribers", result_dict)
         self.assertIsInstance(result_dict["subscribers"], list)
         subscribers: List[int] = []
@@ -5120,21 +6426,20 @@ class GetSubscribersTest(ZulipTestCase):
         never_subscribed = gather_subscriptions_helper(guest_user, True).never_subscribed
 
         # A guest user can only see never subscribed streams that are web-public.
-        # For Polonius, the only web public stream that he is not subscribed at
+        # For Polonius, the only web-public stream that he is not subscribed at
         # this point is Rome.
         self.assert_length(never_subscribed, 1)
 
         web_public_stream_id = never_subscribed[0]["stream_id"]
         result = self.client_get(f"/json/streams/{web_public_stream_id}/members")
-        self.assert_json_success(result)
-        result_dict = result.json()
+        result_dict = self.assert_json_success(result)
         self.assertIn("subscribers", result_dict)
         self.assertIsInstance(result_dict["subscribers"], list)
         self.assertGreater(len(result_dict["subscribers"]), 0)
 
     def test_nonsubscriber_private_stream(self) -> None:
         """
-        A non-subscriber non realm admin user to a private stream can't query that stream's membership.
+        A non-subscriber non-realm-admin user to a private stream can't query that stream's membership.
         But unsubscribed realm admin users can query private stream's membership.
         """
         # Create a private stream for which Hamlet is the only subscriber.
@@ -5145,7 +6450,7 @@ class GetSubscribersTest(ZulipTestCase):
         # Try to fetch the subscriber list as a non-member & non-realm-admin-user.
         stream_id = get_stream(stream_name, user_profile.realm).id
         result = self.make_subscriber_request(stream_id, user=user_profile)
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid stream ID")
 
         # Try to fetch the subscriber list as a non-member & realm-admin-user.
         self.login("iago")
@@ -5168,7 +6473,7 @@ class AccessStreamTest(ZulipTestCase):
         othello = self.example_user("othello")
 
         # Nobody can access a stream that doesn't exist
-        with self.assertRaisesRegex(JsonableError, "Invalid stream id"):
+        with self.assertRaisesRegex(JsonableError, "Invalid stream ID"):
             access_stream_by_id(hamlet, 501232)
         with self.assertRaisesRegex(JsonableError, "Invalid stream name 'invalid stream'"):
             access_stream_by_name(hamlet, "invalid stream")
@@ -5183,7 +6488,7 @@ class AccessStreamTest(ZulipTestCase):
         self.assertEqual(sub_ret, sub_ret2)
 
         # Othello cannot access the private stream
-        with self.assertRaisesRegex(JsonableError, "Invalid stream id"):
+        with self.assertRaisesRegex(JsonableError, "Invalid stream ID"):
             access_stream_by_id(othello, stream.id)
         with self.assertRaisesRegex(JsonableError, "Invalid stream name 'new_private_stream'"):
             access_stream_by_name(othello, stream.name)
@@ -5202,17 +6507,17 @@ class AccessStreamTest(ZulipTestCase):
         mit_realm = get_realm("zephyr")
         mit_stream = ensure_stream(mit_realm, "mit_stream", invite_only=False, acting_user=None)
         sipbtest = self.mit_user("sipbtest")
-        with self.assertRaisesRegex(JsonableError, "Invalid stream id"):
+        with self.assertRaisesRegex(JsonableError, "Invalid stream ID"):
             access_stream_by_id(hamlet, mit_stream.id)
         with self.assertRaisesRegex(JsonableError, "Invalid stream name 'mit_stream'"):
             access_stream_by_name(hamlet, mit_stream.name)
-        with self.assertRaisesRegex(JsonableError, "Invalid stream id"):
+        with self.assertRaisesRegex(JsonableError, "Invalid stream ID"):
             access_stream_by_id(sipbtest, stream.id)
         with self.assertRaisesRegex(JsonableError, "Invalid stream name 'new_private_stream'"):
             access_stream_by_name(sipbtest, stream.name)
 
         # MIT realm users cannot access even public streams in their realm
-        with self.assertRaisesRegex(JsonableError, "Invalid stream id"):
+        with self.assertRaisesRegex(JsonableError, "Invalid stream ID"):
             access_stream_by_id(sipbtest, mit_stream.id)
         with self.assertRaisesRegex(JsonableError, "Invalid stream name 'mit_stream'"):
             access_stream_by_name(sipbtest, mit_stream.name)
@@ -5229,7 +6534,7 @@ class AccessStreamTest(ZulipTestCase):
         stream = self.make_stream(stream_name, guest_user_profile.realm, invite_only=False)
 
         # Guest user don't have access to unsubscribed public streams
-        with self.assertRaisesRegex(JsonableError, "Invalid stream id"):
+        with self.assertRaisesRegex(JsonableError, "Invalid stream ID"):
             access_stream_by_id(guest_user_profile, stream.id)
 
         # Guest user have access to subscribed public streams
@@ -5242,7 +6547,7 @@ class AccessStreamTest(ZulipTestCase):
         stream_name = "private_stream_1"
         stream = self.make_stream(stream_name, guest_user_profile.realm, invite_only=True)
         # Obviously, a guest user doesn't have access to unsubscribed private streams either
-        with self.assertRaisesRegex(JsonableError, "Invalid stream id"):
+        with self.assertRaisesRegex(JsonableError, "Invalid stream ID"):
             access_stream_by_id(guest_user_profile, stream.id)
 
         # Guest user have access to subscribed private streams
@@ -5254,7 +6559,7 @@ class AccessStreamTest(ZulipTestCase):
 
         stream_name = "web_public_stream"
         stream = self.make_stream(stream_name, guest_user_profile.realm, is_web_public=True)
-        # Guest users have access to web public streams even if they aren't subscribed.
+        # Guest users have access to web-public streams even if they aren't subscribed.
         (stream_ret, sub_ret) = access_stream_by_id(guest_user_profile, stream.id)
         self.assertTrue(can_access_stream_history(guest_user_profile, stream))
         assert sub_ret is None

@@ -1,11 +1,12 @@
-import re
 from typing import Any, Dict, Optional
 
 from django.http import HttpRequest
 from django.views.debug import SafeExceptionReporterFilter
+from typing_extensions import override
 
 
 class ZulipExceptionReporterFilter(SafeExceptionReporterFilter):
+    @override
     def get_post_parameters(self, request: Optional[HttpRequest]) -> Dict[str, Any]:
         post_data = SafeExceptionReporterFilter.get_post_parameters(self, request)
         assert isinstance(post_data, dict)
@@ -30,7 +31,3 @@ class ZulipExceptionReporterFilter(SafeExceptionReporterFilter):
             if var in filtered_post:
                 filtered_post[var] = "**********"
         return filtered_post
-
-
-def clean_data_from_query_parameters(val: str) -> str:
-    return re.sub(r"([a-z_-]+=)([^&]+)([&]|$)", r"\1******\3", val)

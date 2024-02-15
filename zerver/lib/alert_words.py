@@ -8,10 +8,11 @@ from zerver.lib.cache import (
     realm_alert_words_automaton_cache_key,
     realm_alert_words_cache_key,
 )
-from zerver.models import AlertWord, Realm, UserProfile, flush_realm_alert_words
+from zerver.models import AlertWord, Realm, UserProfile
+from zerver.models.alert_words import flush_realm_alert_words
 
 
-@cache_with_key(realm_alert_words_cache_key, timeout=3600 * 24)
+@cache_with_key(lambda realm: realm_alert_words_cache_key(realm.id), timeout=3600 * 24)
 def alert_words_in_realm(realm: Realm) -> Dict[int, List[str]]:
     user_ids_and_words = AlertWord.objects.filter(realm=realm, user_profile__is_active=True).values(
         "user_profile_id", "word"
@@ -23,11 +24,11 @@ def alert_words_in_realm(realm: Realm) -> Dict[int, List[str]]:
     return user_ids_with_words
 
 
-@cache_with_key(realm_alert_words_automaton_cache_key, timeout=3600 * 24)
+@cache_with_key(lambda realm: realm_alert_words_automaton_cache_key(realm.id), timeout=3600 * 24)
 def get_alert_word_automaton(realm: Realm) -> ahocorasick.Automaton:
     user_id_with_words = alert_words_in_realm(realm)
     alert_word_automaton = ahocorasick.Automaton()
-    for (user_id, alert_words) in user_id_with_words.items():
+    for user_id, alert_words in user_id_with_words.items():
         for alert_word in alert_words:
             alert_word_lower = alert_word.lower()
             if alert_word_automaton.exists(alert_word_lower):
@@ -39,7 +40,7 @@ def get_alert_word_automaton(realm: Realm) -> ahocorasick.Automaton:
     # If the kind is not AHOCORASICK after calling make_automaton, it means there is no key present
     # and hence we cannot call items on the automaton yet. To avoid it we return None for such cases
     # where there is no alert-words in the realm.
-    # https://pyahocorasick.readthedocs.io/en/latest/index.html?highlight=Automaton.kind#module-constants
+    # https://pyahocorasick.readthedocs.io/en/latest/#make-automaton
     if alert_word_automaton.kind != ahocorasick.AHOCORASICK:
         return None
     return alert_word_automaton
@@ -66,7 +67,7 @@ def add_user_alert_words(user_profile: UserProfile, new_words: Iterable[str]) ->
         for word in word_dict.values()
     )
     # Django bulk_create operations don't flush caches, so we need to do this ourselves.
-    flush_realm_alert_words(user_profile.realm)
+    flush_realm_alert_words(user_profile.realm_id)
 
     return user_alert_words(user_profile)
 

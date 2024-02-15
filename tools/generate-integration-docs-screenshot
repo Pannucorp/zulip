@@ -33,12 +33,9 @@ import zulip
 
 from scripts.lib.zulip_tools import BOLDRED, ENDC
 from tools.lib.test_script import prepare_puppeteer_run
-from zerver.lib.actions import (
-    bulk_add_subscriptions,
-    do_change_avatar_fields,
-    do_create_user,
-    notify_created_bot,
-)
+from zerver.actions.create_user import do_create_user, notify_created_bot
+from zerver.actions.streams import bulk_add_subscriptions
+from zerver.actions.user_settings import do_change_avatar_fields
 from zerver.lib.integrations import (
     DOC_SCREENSHOT_CONFIG,
     INTEGRATIONS,
@@ -53,7 +50,9 @@ from zerver.lib.storage import static_path
 from zerver.lib.streams import create_stream_if_needed
 from zerver.lib.upload import upload_avatar_image
 from zerver.lib.webhooks.common import get_fixture_http_headers
-from zerver.models import Message, UserProfile, get_realm, get_user_by_delivery_email
+from zerver.models import Message, UserProfile
+from zerver.models.realms import get_realm
+from zerver.models.users import get_user_by_delivery_email
 
 
 def create_integration_bot(integration: Integration, bot_name: Optional[str] = None) -> UserProfile:
@@ -133,8 +132,8 @@ def custom_headers(headers_json: str) -> Dict[str, str]:
         return orjson.loads(headers_json)
     except orjson.JSONDecodeError as ve:
         raise argparse.ArgumentTypeError(
-            "Encountered an error while attempting to parse custom headers: {}\n"
-            "Note: all strings must be enclosed within \"\" instead of ''".format(ve)
+            f"Encountered an error while attempting to parse custom headers: {ve}\n"
+            "Note: all strings must be enclosed within \"\" instead of ''"
         )
 
 
@@ -142,7 +141,7 @@ def send_bot_mock_message(
     bot: UserProfile, integration: Integration, fixture_path: str, config: BaseScreenshotConfig
 ) -> None:
     # Delete all messages, so new message is the only one it's message group
-    Message.objects.filter(sender=bot).delete()
+    Message.objects.filter(realm_id=bot.realm_id, sender=bot).delete()
     data, _, _ = get_fixture_info(fixture_path)
 
     assert bot.bot_owner is not None
@@ -159,10 +158,8 @@ def send_bot_mock_message(
         client.send_message(request)
     except KeyError:
         print(
-            "{} contains invalid configuration. "
-            'Fields "subject" and "body" are required for non-webhook integrations.'.format(
-                fixture_path
-            )
+            f"{fixture_path} contains invalid configuration. "
+            'Fields "subject" and "body" are required for non-webhook integrations.'
         )
         sys.exit(1)
 
@@ -171,7 +168,7 @@ def send_bot_payload_message(
     bot: UserProfile, integration: WebhookIntegration, fixture_path: str, config: ScreenshotConfig
 ) -> bool:
     # Delete all messages, so new message is the only one it's message group
-    Message.objects.filter(sender=bot).delete()
+    Message.objects.filter(realm_id=bot.realm_id, sender=bot).delete()
     data, json_fixture, fixture_name = get_fixture_info(fixture_path)
 
     headers = get_requests_headers(integration.name, fixture_name)
@@ -209,7 +206,7 @@ def send_bot_payload_message(
     except requests.exceptions.ConnectionError:
         print(
             "This tool needs the local dev server to be running. "
-            "Please start it using tools/run-dev.py before running this tool."
+            "Please start it using tools/run-dev before running this tool."
         )
         sys.exit(1)
     if response.status_code != 200:
@@ -222,7 +219,7 @@ def send_bot_payload_message(
 
 
 def capture_last_message_screenshot(bot: UserProfile, image_path: str) -> None:
-    message = Message.objects.filter(sender=bot).last()
+    message = Message.objects.filter(realm_id=bot.realm_id, sender=bot).last()
     realm = get_realm("zulip")
     if message is None:
         print(f"No message found for {bot.full_name}")
@@ -255,7 +252,11 @@ def generate_screenshot_from_config(
 parser = argparse.ArgumentParser()
 group = parser.add_mutually_exclusive_group(required=True)
 group.add_argument("--all", action="store_true")
-group.add_argument("--integration", help="Name of the integration")
+group.add_argument(
+    "--skip-until", help="Name of the integration whose predecessor are skipped. Similar to --all"
+)
+group.add_argument("--integration", nargs="+", help="Names of the integrations")
+fixture_group = parser.add_argument_group("integration")
 parser.add_argument("--fixture", help="Name of the fixture file to use")
 parser.add_argument("--image-name", help="Name for the screenshot image")
 parser.add_argument("--image-dir", help="Directory name where to save the screenshot image")
@@ -284,11 +285,32 @@ if options.all:
     for key, value in vars(options).items():
         if key != "all" and value:
             print("Generating screenshots for all integrations. Ignoring all command-line options")
+            break
     for integration_name, screenshot_configs in DOC_SCREENSHOT_CONFIG.items():
         for screenshot_config in screenshot_configs:
             generate_screenshot_from_config(integration_name, screenshot_config)
 
+elif options.skip_until:
+    for key, value in vars(options).items():
+        if key != "skip_until" and value:
+            print(
+                f"Generating screenshots for all integrations skipping until {options.skip_until}. Ignoring all command-line options"
+            )
+            break
+    skip = True
+    for integration_name, screenshot_configs in DOC_SCREENSHOT_CONFIG.items():
+        if integration_name == options.skip_until:
+            skip = False
+        if skip:
+            continue
+        for screenshot_config in screenshot_configs:
+            generate_screenshot_from_config(integration_name, screenshot_config)
+
 elif options.fixture:
+    if len(options.integration) != 1:
+        parser.error(
+            "Exactly one integration should be specified for --integration when --fixture is provided"
+        )
     config = dict(
         fixture_name=options.fixture,
         use_basic_auth=options.use_basic_auth,
@@ -304,12 +326,14 @@ elif options.fixture:
     if options.payload_param_name:
         config["payload_param_name"] = options.payload_param_name
     screenshot_config = ScreenshotConfig(**config)
-    generate_screenshot_from_config(options.integration, screenshot_config)
+    generate_screenshot_from_config(options.integration[0], screenshot_config)
 
-elif options.integration in DOC_SCREENSHOT_CONFIG:
-    configs = DOC_SCREENSHOT_CONFIG[options.integration]
-    for screenshot_config in configs:
-        generate_screenshot_from_config(options.integration, screenshot_config)
+elif options.integration:
+    for integration in options.integration:
+        assert integration in DOC_SCREENSHOT_CONFIG
+        configs = DOC_SCREENSHOT_CONFIG[integration]
+        for screenshot_config in configs:
+            generate_screenshot_from_config(integration, screenshot_config)
 
 else:
     parser.error(

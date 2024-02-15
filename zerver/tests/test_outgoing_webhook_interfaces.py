@@ -3,19 +3,26 @@ from typing import Any, Dict
 from unittest import mock
 
 import requests
+from typing_extensions import override
 
 from zerver.lib.avatar import get_gravatar_url
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.message import MessageDict
+from zerver.lib.message_cache import MessageDict
 from zerver.lib.outgoing_webhook import get_service_interface_class, process_success_response
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.timestamp import datetime_to_timestamp
 from zerver.lib.topic import TOPIC_NAME
-from zerver.models import SLACK_INTERFACE, Message, get_realm, get_stream, get_user
+from zerver.models import Message
+from zerver.models.bots import SLACK_INTERFACE
+from zerver.models.realms import get_realm
+from zerver.models.scheduled_jobs import NotificationTriggers
+from zerver.models.streams import get_stream
+from zerver.models.users import get_user
 from zerver.openapi.openapi import validate_against_openapi_schema
 
 
 class TestGenericOutgoingWebhookService(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
 
@@ -149,6 +156,7 @@ class TestGenericOutgoingWebhookService(ZulipTestCase):
 
 
 class TestSlackOutgoingWebhookService(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.bot_user = get_user("outgoing-webhook@zulip.com", get_realm("zulip"))
@@ -174,7 +182,7 @@ class TestSlackOutgoingWebhookService(ZulipTestCase):
             "user_profile_id": 24,
             "service_name": "test-service",
             "command": "test content",
-            "trigger": "private_message",
+            "trigger": NotificationTriggers.DIRECT_MESSAGE,
             "message": {
                 "sender_id": 3,
                 "sender_realm_str": "zulip",

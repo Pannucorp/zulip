@@ -1,14 +1,15 @@
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Tuple
 
 import orjson
 from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext as _
+from pydantic import Json
 
 from zerver.decorator import webhook_view
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
+from zerver.lib.typed_endpoint import typed_endpoint
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -20,7 +21,7 @@ SNAPSHOT = "image_url"
 class LibratoWebhookParser:
     ALERT_URL_TEMPLATE = "https://metrics.librato.com/alerts#/{alert_id}"
 
-    def __init__(self, payload: Dict[str, Any], attachments: List[Dict[str, Any]]) -> None:
+    def __init__(self, payload: Mapping[str, Any], attachments: List[Dict[str, Any]]) -> None:
         self.payload = payload
         self.attachments = attachments
 
@@ -41,7 +42,7 @@ class LibratoWebhookParser:
 
     def parse_violation(self, violation: Dict[str, Any]) -> Tuple[str, str]:
         metric_name = violation["metric"]
-        recorded_at = datetime.fromtimestamp((violation["recorded_at"]), tz=timezone.utc).strftime(
+        recorded_at = datetime.fromtimestamp(violation["recorded_at"], tz=timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
         return metric_name, recorded_at
@@ -64,7 +65,7 @@ class LibratoWebhookParser:
 
 
 class LibratoWebhookHandler(LibratoWebhookParser):
-    def __init__(self, payload: Dict[str, Any], attachments: List[Dict[str, Any]]) -> None:
+    def __init__(self, payload: Mapping[str, Any], attachments: List[Dict[str, Any]]) -> None:
         super().__init__(payload, attachments)
         self.payload_available_types = {
             ALERT_CLEAR: self.handle_alert_clear_message,
@@ -80,9 +81,9 @@ class LibratoWebhookHandler(LibratoWebhookParser):
             if self.payload.get(available_type):
                 return self.payload_available_types[available_type]
         for available_type in self.attachments_available_types:
-            if self.attachments[0].get(available_type):
+            if len(self.attachments) > 0 and self.attachments[0].get(available_type):
                 return self.attachments_available_types[available_type]
-        raise Exception("Unexcepted message type")
+        raise Exception("Unexpected message type")
 
     def handle(self) -> str:
         return self.find_handle_method()()
@@ -97,7 +98,7 @@ class LibratoWebhookHandler(LibratoWebhookParser):
     def handle_alert_clear_message(self) -> str:
         alert_clear_template = "Alert [alert_name]({alert_url}) has cleared at {trigger_time} UTC!"
         trigger_time = datetime.fromtimestamp(
-            (self.payload["trigger_time"]), tz=timezone.utc
+            self.payload["trigger_time"], tz=timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S")
         alert_id, alert_name, alert_url, alert_runbook_url = self.parse_alert()
         content = alert_clear_template.format(
@@ -158,11 +159,14 @@ class LibratoWebhookHandler(LibratoWebhookParser):
 
 
 @webhook_view("Librato")
-@has_request_variables
+@typed_endpoint
 def api_librato_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: Dict[str, Any] = REQ(converter=orjson.loads, default={}),
+    *,
+    payload: Json[
+        Mapping[str, Any]
+    ] = {},  # noqa: B006 # Mapping is indeed immutable, but Json's type annotation drops that information
 ) -> HttpResponse:
     try:
         attachments = orjson.loads(request.body).get("attachments", [])
@@ -173,12 +177,12 @@ def api_librato_webhook(
         raise JsonableError(_("Malformed JSON input"))
 
     message_handler = LibratoWebhookHandler(payload, attachments)
-    topic = message_handler.generate_topic()
+    topic_name = message_handler.generate_topic()
 
     try:
         content = message_handler.handle()
     except Exception as e:
         raise JsonableError(str(e))
 
-    check_send_webhook_message(request, user_profile, topic, content)
-    return json_success()
+    check_send_webhook_message(request, user_profile, topic_name, content)
+    return json_success(request)

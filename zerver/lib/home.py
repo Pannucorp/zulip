@@ -1,7 +1,7 @@
 import calendar
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from django.conf import settings
 from django.http import HttpRequest
@@ -15,15 +15,21 @@ from zerver.lib.i18n import (
     get_language_list,
     get_language_translation_data,
 )
+from zerver.lib.narrow_helpers import NarrowTerm
+from zerver.lib.push_notifications import uses_notification_bouncer
+from zerver.lib.realm_description import get_realm_rendered_description
 from zerver.lib.request import RequestNotes
 from zerver.models import Message, Realm, Stream, UserProfile
 from zerver.views.message_flags import get_latest_update_message_flag_activity
+from zproject.config import get_config
 
 
 @dataclass
 class BillingInfo:
     show_billing: bool
     show_plans: bool
+    sponsorship_pending: bool
+    show_remote_billing: bool
 
 
 @dataclass
@@ -72,25 +78,36 @@ def promote_sponsoring_zulip_in_realm(realm: Realm) -> bool:
 
 
 def get_billing_info(user_profile: Optional[UserProfile]) -> BillingInfo:
+    # See https://zulip.com/help/roles-and-permissions for clarity.
     show_billing = False
     show_plans = False
-    if settings.CORPORATE_ENABLED and user_profile is not None:
-        if user_profile.has_billing_access:
-            from corporate.models import CustomerPlan, get_customer_by_realm
+    sponsorship_pending = False
+    show_remote_billing = (
+        user_profile is not None and user_profile.has_billing_access and uses_notification_bouncer()
+    )
 
-            customer = get_customer_by_realm(user_profile.realm)
-            if customer is not None:
-                if customer.sponsorship_pending:
-                    show_billing = True
-                elif CustomerPlan.objects.filter(customer=customer).exists():
-                    show_billing = True
+    # This query runs on home page load, so we want to avoid
+    # hitting the database if possible. So, we only run it for the user
+    # types that can actually see the billing info.
+    if settings.CORPORATE_ENABLED and user_profile is not None and user_profile.has_billing_access:
+        from corporate.models import CustomerPlan, get_customer_by_realm
 
-        if not user_profile.is_guest and user_profile.realm.plan_type == Realm.PLAN_TYPE_LIMITED:
+        customer = get_customer_by_realm(user_profile.realm)
+        if customer is not None:
+            if customer.sponsorship_pending:
+                sponsorship_pending = True
+
+            if CustomerPlan.objects.filter(customer=customer).exists():
+                show_billing = True
+
+        if user_profile.realm.plan_type == Realm.PLAN_TYPE_LIMITED:
             show_plans = True
 
     return BillingInfo(
         show_billing=show_billing,
         show_plans=show_plans,
+        sponsorship_pending=sponsorship_pending,
+        show_remote_billing=show_remote_billing,
     )
 
 
@@ -118,13 +135,11 @@ def build_page_params_for_home_page_load(
     user_profile: Optional[UserProfile],
     realm: Realm,
     insecure_desktop_app: bool,
-    narrow: List[List[str]],
+    narrow: List[NarrowTerm],
     narrow_stream: Optional[Stream],
-    narrow_topic: Optional[str],
-    first_in_realm: bool,
-    prompt_for_invites: bool,
+    narrow_topic_name: Optional[str],
     needs_tutorial: bool,
-) -> Tuple[int, Dict[str, Any]]:
+) -> Tuple[int, Dict[str, object]]:
     """
     This function computes page_params for when we load the home page.
 
@@ -134,8 +149,10 @@ def build_page_params_for_home_page_load(
         "notification_settings_null": True,
         "bulk_message_deletion": True,
         "user_avatar_url_field_optional": True,
-        "stream_typing_notifications": False,  # Set this to True when frontend support is implemented.
+        "stream_typing_notifications": True,
         "user_settings_object": True,
+        "linkifier_url_template": True,
+        "user_list_incomplete": True,
     }
 
     if user_profile is not None:
@@ -143,6 +160,7 @@ def build_page_params_for_home_page_load(
         assert client is not None
         register_ret = do_events_register(
             user_profile,
+            realm,
             client,
             apply_markdown=True,
             client_gravatar=True,
@@ -151,62 +169,52 @@ def build_page_params_for_home_page_load(
             narrow=narrow,
             include_streams=False,
         )
+        default_language = register_ret["user_settings"]["default_language"]
     else:
-        # Since events for spectator is not implemented, we only fetch the data
-        # at the time of request and don't register for any events.
-        # TODO: Implement events for spectator.
-        from zerver.lib.events import fetch_initial_state_data, post_process_state
+        # The spectator client will be fetching the /register response
+        # for spectators via the API. But we still need to set the
+        # values not presence in that object.
+        register_ret = {
+            "queue_id": None,
+        }
+        default_language = realm.default_language
 
-        register_ret = fetch_initial_state_data(
-            user_profile,
-            realm=realm,
-            event_types=None,
-            queue_id=None,
-            client_gravatar=False,
-            user_avatar_url_field_optional=client_capabilities["user_avatar_url_field_optional"],
-            user_settings_object=client_capabilities["user_settings_object"],
-            slim_presence=False,
-            include_subscribers=False,
-            include_streams=False,
+    if user_profile is None:
+        request_language = request.COOKIES.get(settings.LANGUAGE_COOKIE_NAME, default_language)
+    else:
+        request_language = get_and_set_request_language(
+            request,
+            default_language,
+            translation.get_language_from_path(request.path_info),
         )
 
-        post_process_state(user_profile, register_ret, False)
-
     furthest_read_time = get_furthest_read_time(user_profile)
-
-    request_language = get_and_set_request_language(
-        request,
-        register_ret["user_settings"]["default_language"],
-        translation.get_language_from_path(request.path_info),
-    )
-
     two_fa_enabled = settings.TWO_FACTOR_AUTHENTICATION_ENABLED and user_profile is not None
     billing_info = get_billing_info(user_profile)
     user_permission_info = get_user_permission_info(user_profile)
 
     # Pass parameters to the client-side JavaScript code.
     # These end up in a JavaScript Object named 'page_params'.
-    page_params = dict(
+    page_params: Dict[str, object] = dict(
         ## Server settings.
         test_suite=settings.TEST_SUITE,
         insecure_desktop_app=insecure_desktop_app,
         login_page=settings.HOME_NOT_LOGGED_IN,
         warn_no_email=settings.WARN_NO_EMAIL,
-        search_pills_enabled=settings.SEARCH_PILLS_ENABLED,
         # Only show marketing email settings if on Zulip Cloud
         corporate_enabled=settings.CORPORATE_ENABLED,
         ## Misc. extra data.
         language_list=get_language_list(),
         needs_tutorial=needs_tutorial,
-        first_in_realm=first_in_realm,
-        prompt_for_invites=prompt_for_invites,
         furthest_read_time=furthest_read_time,
         bot_types=get_bot_types(user_profile),
         two_fa_enabled=two_fa_enabled,
         apps_page_url=get_apps_page_url(),
         show_billing=billing_info.show_billing,
+        show_remote_billing=billing_info.show_remote_billing,
         promote_sponsoring_zulip=promote_sponsoring_zulip_in_realm(realm),
         show_plans=billing_info.show_plans,
+        sponsorship_pending=billing_info.sponsorship_pending,
         show_webathena=user_permission_info.show_webathena,
         # Adding two_fa_enabled as condition saves us 3 queries when
         # 2FA is not enabled.
@@ -215,28 +223,48 @@ def build_page_params_for_home_page_load(
         # There is no event queue for spectators since
         # events support for spectators is not implemented yet.
         no_event_queue=user_profile is None,
+        server_sentry_dsn=settings.SENTRY_FRONTEND_DSN,
     )
 
-    for field_name in register_ret.keys():
+    if settings.SENTRY_FRONTEND_DSN is not None:
+        page_params["realm_sentry_key"] = realm.string_id
+        page_params["server_sentry_environment"] = get_config(
+            "machine", "deploy_type", "development"
+        )
+        page_params["server_sentry_sample_rate"] = settings.SENTRY_FRONTEND_SAMPLE_RATE
+        page_params["server_sentry_trace_rate"] = settings.SENTRY_FRONTEND_TRACE_RATE
+
+    for field_name in register_ret:
         page_params[field_name] = register_ret[field_name]
 
     if narrow_stream is not None:
         # In narrow_stream context, initial pointer is just latest message
         recipient = narrow_stream.recipient
-        try:
-            max_message_id = (
-                Message.objects.filter(recipient=recipient).order_by("id").reverse()[0].id
-            )
-        except IndexError:
-            max_message_id = -1
+        page_params["max_message_id"] = -1
+        max_message = (
+            # Uses index: zerver_message_realm_recipient_id
+            Message.objects.filter(realm_id=realm.id, recipient=recipient)
+            .order_by("-id")
+            .only("id")
+            .first()
+        )
+        if max_message:
+            page_params["max_message_id"] = max_message.id
         page_params["narrow_stream"] = narrow_stream.name
-        if narrow_topic is not None:
-            page_params["narrow_topic"] = narrow_topic
-        page_params["narrow"] = [dict(operator=term[0], operand=term[1]) for term in narrow]
-        page_params["max_message_id"] = max_message_id
+        if narrow_topic_name is not None:
+            page_params["narrow_topic"] = narrow_topic_name
+        page_params["narrow"] = [
+            dict(operator=term.operator, operand=term.operand) for term in narrow
+        ]
         assert isinstance(page_params["user_settings"], dict)
         page_params["user_settings"]["enable_desktop_notifications"] = False
 
     page_params["translation_data"] = get_language_translation_data(request_language)
+
+    if user_profile is None:
+        # Get rendered version of realm description which is displayed in right
+        # sidebar for spectator.
+        page_params["realm_rendered_description"] = get_realm_rendered_description(realm)
+        page_params["language_cookie_name"] = settings.LANGUAGE_COOKIE_NAME
 
     return register_ret["queue_id"], page_params

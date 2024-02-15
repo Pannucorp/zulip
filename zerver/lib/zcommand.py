@@ -2,22 +2,16 @@ from typing import Any, Dict
 
 from django.utils.translation import gettext as _
 
-from zerver.lib.actions import do_change_user_setting
+from zerver.actions.user_settings import do_change_user_setting
 from zerver.lib.exceptions import JsonableError
 from zerver.models import UserProfile
 
 
 def process_zcommands(content: str, user_profile: UserProfile) -> Dict[str, Any]:
     def change_mode_setting(
-        command: str, switch_command: str, setting: str, setting_value: int
+        setting_name: str, switch_command: str, setting: str, setting_value: int
     ) -> str:
-        msg = (
-            "Changed to {command} mode! To revert "
-            "{command} mode, type `/{switch_command}`.".format(
-                command=command,
-                switch_command=switch_command,
-            )
-        )
+        msg = f"Changed to {setting_name}! To revert {setting_name}, type `/{switch_command}`."
         do_change_user_setting(
             user_profile=user_profile,
             setting_name=setting,
@@ -34,10 +28,10 @@ def process_zcommands(content: str, user_profile: UserProfile) -> Dict[str, Any]
         return {}
     elif command == "night":
         if user_profile.color_scheme == UserProfile.COLOR_SCHEME_NIGHT:
-            return dict(msg="You are still in dark mode.")
+            return dict(msg="You are still in dark theme.")
         return dict(
             msg=change_mode_setting(
-                command="dark",
+                setting_name="dark theme",
                 switch_command="light",
                 setting="color_scheme",
                 setting_value=UserProfile.COLOR_SCHEME_NIGHT,
@@ -45,10 +39,10 @@ def process_zcommands(content: str, user_profile: UserProfile) -> Dict[str, Any]
         )
     elif command == "day":
         if user_profile.color_scheme == UserProfile.COLOR_SCHEME_LIGHT:
-            return dict(msg="You are still in light mode.")
+            return dict(msg="You are still in light theme.")
         return dict(
             msg=change_mode_setting(
-                command="light",
+                setting_name="light theme",
                 switch_command="dark",
                 setting="color_scheme",
                 setting_value=UserProfile.COLOR_SCHEME_LIGHT,
@@ -59,7 +53,7 @@ def process_zcommands(content: str, user_profile: UserProfile) -> Dict[str, Any]
             return dict(msg="You are still in fluid width mode.")
         return dict(
             msg=change_mode_setting(
-                command=command,
+                setting_name="fluid-width mode",
                 switch_command="fixed-width",
                 setting="fluid_layout_width",
                 setting_value=True,
@@ -70,10 +64,10 @@ def process_zcommands(content: str, user_profile: UserProfile) -> Dict[str, Any]
             return dict(msg="You are still in fixed width mode.")
         return dict(
             msg=change_mode_setting(
-                command=command,
+                setting_name="fixed-width mode",
                 switch_command="fluid-width",
                 setting="fluid_layout_width",
                 setting_value=False,
             )
         )
-    raise JsonableError(_("No such command: {}").format(command))
+    raise JsonableError(_("No such command: {command}").format(command=command))

@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Optional
 
 import sentry_sdk
@@ -9,6 +10,7 @@ from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from sentry_sdk.utils import capture_internal_exceptions
 
 from version import ZULIP_VERSION
+from zproject.config import DEPLOY_ROOT
 
 if TYPE_CHECKING:
     from sentry_sdk._types import Event, Hint
@@ -22,8 +24,7 @@ def add_context(event: "Event", hint: "Hint") -> Optional["Event"]:
             return None
     from django.conf import settings
 
-    from zerver.lib.request import RequestNotes, get_current_request
-    from zerver.models import get_user_profile_by_id
+    from zerver.models.users import get_user_profile_by_id
 
     with capture_internal_exceptions():
         # event.user is the user context, from Sentry, which is
@@ -45,29 +46,31 @@ def add_context(event: "Event", hint: "Hint") -> Optional["Event"]:
         if "email" in user_info:
             del user_info["email"]
 
-        request = get_current_request()
-        if request:
-            request_notes = RequestNotes.get_notes(request)
-            if request_notes.client is not None:
-                event["tags"]["client"] = request_notes.client.name
-            if request_notes.realm is not None:
-                event["tags"].setdefault("realm", request_notes.realm.string_id)
     return event
 
 
 def setup_sentry(dsn: Optional[str], environment: str) -> None:
     if not dsn:
         return
+
+    sentry_release = ZULIP_VERSION
+    if os.path.exists(os.path.join(DEPLOY_ROOT, "sentry-release")):
+        with open(os.path.join(DEPLOY_ROOT, "sentry-release")) as sentry_release_file:
+            sentry_release = sentry_release_file.readline().strip()
     sentry_sdk.init(
         dsn=dsn,
         environment=environment,
-        release=ZULIP_VERSION,
+        release=sentry_release,
         integrations=[
             DjangoIntegration(),
             RedisIntegration(),
             SqlalchemyIntegration(),
         ],
         before_send=add_context,
+        # Increase possible max wait to send exceptions during
+        # shutdown, from 2 to 10; potentially-large exceptions are of
+        # value to catch during shutdown.
+        shutdown_timeout=10,
         # Because we strip the email/username from the Sentry data
         # above, the effect of this flag is that the requests/users
         # involved in exceptions will be identified in Sentry only by
@@ -79,7 +82,7 @@ def setup_sentry(dsn: Optional[str], environment: str) -> None:
     )
 
     # Ignore all of the loggers from django.security that are for user
-    # errors; see https://docs.djangoproject.com/en/3.0/ref/exceptions/#suspiciousoperation
+    # errors; see https://docs.djangoproject.com/en/3.2/ref/exceptions/#suspiciousoperation
     ignore_logger("django.security.SuspiciousOperation")
     ignore_logger("django.security.DisallowedHost")
     ignore_logger("django.security.DisallowedModelAdminLookup")

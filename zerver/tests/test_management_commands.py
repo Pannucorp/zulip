@@ -4,6 +4,7 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional
 from unittest import mock, skipUnless
 from unittest.mock import MagicMock, call, patch
+from urllib.parse import quote, quote_plus
 
 from django.apps import apps
 from django.conf import settings
@@ -11,22 +12,18 @@ from django.core.management import call_command, find_commands
 from django.core.management.base import CommandError
 from django.test import override_settings
 from django.utils.timezone import now as timezone_now
+from typing_extensions import override
 
 from confirmation.models import RealmCreationKey, generate_realm_creation_url
-from zerver.lib.actions import do_add_reaction, do_create_user
+from zerver.actions.create_user import do_create_user
+from zerver.actions.reactions import do_add_reaction
 from zerver.lib.management import ZulipBaseCommand, check_config
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import most_recent_message, stdout_suppressed
-from zerver.models import (
-    Message,
-    Reaction,
-    Realm,
-    Recipient,
-    UserProfile,
-    get_realm,
-    get_stream,
-    get_user_profile_by_email,
-)
+from zerver.models import Message, Reaction, Realm, Recipient, UserProfile
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_stream
+from zerver.models.users import get_user_profile_by_email
 
 
 class TestCheckConfig(ZulipTestCase):
@@ -45,6 +42,7 @@ class TestCheckConfig(ZulipTestCase):
 
 
 class TestZulipBaseCommand(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.zulip_realm = get_realm("zulip")
@@ -127,11 +125,11 @@ class TestZulipBaseCommand(ZulipTestCase):
             self.command.get_users(dict(users=user_emails), self.zulip_realm)
 
         self.assertEqual(
-            self.command.get_users(dict(users=self.example_email("iago")), self.zulip_realm),
+            list(self.command.get_users(dict(users=self.example_email("iago")), self.zulip_realm)),
             [self.example_user("iago")],
         )
 
-        self.assertEqual(self.command.get_users(dict(users=None), None), [])
+        self.assertEqual(list(self.command.get_users(dict(users=None), None)), [])
 
     def test_get_users_with_all_users_argument_enabled(self) -> None:
         expected_user_profiles = self.sorted_users(
@@ -198,6 +196,7 @@ class TestZulipBaseCommand(ZulipTestCase):
 
 
 class TestCommandsCanStart(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.commands = [
@@ -222,6 +221,7 @@ class TestCommandsCanStart(ZulipTestCase):
 class TestSendWebhookFixtureMessage(ZulipTestCase):
     COMMAND_NAME = "send_webhook_fixture_message"
 
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.fixture_path = os.path.join("some", "fake", "path.json")
@@ -298,45 +298,62 @@ class TestGenerateRealmCreationLink(ZulipTestCase):
         # Enter email
         with self.assertRaises(Realm.DoesNotExist):
             get_realm("test")
-        result = self.client_post(generated_link, {"email": email})
+        result = self.client_post(
+            generated_link,
+            {
+                "email": email,
+                "realm_name": "Zulip test",
+                "realm_type": Realm.ORG_TYPES["business"]["id"],
+                "realm_default_language": "en",
+                "realm_subdomain": "custom-test",
+            },
+        )
         self.assertEqual(result.status_code, 302)
         self.assertTrue(re.search(r"/accounts/do_confirm/\w+$", result["Location"]))
 
         # Bypass sending mail for confirmation, go straight to creation form
         result = self.client_get(result["Location"])
-        self.assert_in_response('action="/accounts/register/"', result)
+        self.assert_in_response('action="/realm/register/"', result)
 
         # Original link is now dead
         result = self.client_get(generated_link)
-        self.assert_in_success_response(
-            ["The organization creation link has expired or is not valid."], result
-        )
+        self.assert_in_success_response(["Organization creation link expired or invalid"], result)
 
     @override_settings(OPEN_REALM_CREATION=False)
     def test_generate_link_confirm_email(self) -> None:
         email = "user1@test.com"
+        realm_name = "Zulip test"
+        string_id = "custom-test"
         generated_link = generate_realm_creation_url(by_admin=False)
 
-        result = self.client_post(generated_link, {"email": email})
+        result = self.client_post(
+            generated_link,
+            {
+                "email": email,
+                "realm_name": realm_name,
+                "realm_type": Realm.ORG_TYPES["business"]["id"],
+                "realm_default_language": "en",
+                "realm_subdomain": string_id,
+            },
+        )
         self.assertEqual(result.status_code, 302)
-        self.assertTrue(re.search(f"/accounts/new/send_confirm/{email}$", result["Location"]))
+        self.assertEqual(
+            f"/accounts/new/send_confirm/?email={quote(email)}&realm_name={quote_plus(realm_name)}&realm_type=10&realm_default_language=en&realm_subdomain={string_id}",
+            result["Location"],
+        )
         result = self.client_get(result["Location"])
-        self.assert_in_response("Check your email so we can get started", result)
+        self.assert_in_response("check your email", result)
 
         # Original link is now dead
         result = self.client_get(generated_link)
-        self.assert_in_success_response(
-            ["The organization creation link has expired or is not valid."], result
-        )
+        self.assert_in_success_response(["Organization creation link expired or invalid"], result)
 
     @override_settings(OPEN_REALM_CREATION=False)
     def test_realm_creation_with_random_link(self) -> None:
         # Realm creation attempt with an invalid link should fail
         random_link = "/new/5e89081eb13984e0f3b130bf7a4121d153f1614b"
         result = self.client_get(random_link)
-        self.assert_in_success_response(
-            ["The organization creation link has expired or is not valid."], result
-        )
+        self.assert_in_success_response(["Organization creation link expired or invalid"], result)
 
     @override_settings(OPEN_REALM_CREATION=False)
     def test_realm_creation_with_expired_link(self) -> None:
@@ -350,9 +367,7 @@ class TestGenerateRealmCreationLink(ZulipTestCase):
         obj.save()
 
         result = self.client_get(generated_link)
-        self.assert_in_success_response(
-            ["The organization creation link has expired or is not valid."], result
-        )
+        self.assert_in_success_response(["Organization creation link expired or invalid"], result)
 
 
 @skipUnless(settings.ZILENCER_ENABLED, "requires zilencer")
@@ -381,7 +396,7 @@ class TestPasswordRestEmail(ZulipTestCase):
         self.assertEqual(self.email_envelope_from(outbox[0]), settings.NOREPLY_EMAIL_ADDRESS)
         self.assertRegex(
             self.email_display_from(outbox[0]),
-            fr"^Zulip Account Security <{self.TOKENIZED_NOREPLY_REGEX}>\Z",
+            rf"^testserver account security <{self.TOKENIZED_NOREPLY_REGEX}>\Z",
         )
         self.assertIn("reset your password", outbox[0].body)
 
@@ -525,11 +540,11 @@ class TestExport(ZulipTestCase):
                 realm=realm,
                 public_only=False,
                 consent_message_id=message.id,
-                delete_after_upload=False,
                 threads=mock.ANY,
                 output_dir=mock.ANY,
                 percent_callback=mock.ANY,
                 upload=False,
+                export_as_active=None,
             )
             mock_input.assert_called_once_with("Continue? [y/N] ")
 
@@ -592,6 +607,7 @@ class TestSendCustomEmail(ZulipTestCase):
     def test_custom_email_with_dry_run(self) -> None:
         path = "templates/zerver/tests/markdown/test_nested_code_blocks.md"
         user = self.example_user("hamlet")
+        other_user = self.example_user("cordelia")
 
         with patch("builtins.print") as mock_print:
             call_command(
@@ -600,13 +616,32 @@ class TestSendCustomEmail(ZulipTestCase):
                 f"--path={path}",
                 f"-u={user.delivery_email}",
                 "--subject=Test email",
-                "--from-name=zulip@testserver.com",
+                "--from-name=zulip@zulip.example.com",
                 "--dry-run",
             )
             self.assertEqual(
                 mock_print.mock_calls[1:],
                 [
                     call("Would send the above email to:"),
+                    call("  hamlet@zulip.com (zulip)"),
+                ],
+            )
+
+        with patch("builtins.print") as mock_print:
+            call_command(
+                self.COMMAND_NAME,
+                "-r=zulip",
+                f"--path={path}",
+                f"-u={user.delivery_email},{other_user.delivery_email}",
+                "--subject=Test email",
+                "--from-name=zulip@zulip.example.com",
+                "--dry-run",
+            )
+            self.assertEqual(
+                mock_print.mock_calls[1:],
+                [
+                    call("Would send the above email to:"),
+                    call("  cordelia@zulip.com (zulip)"),
                     call("  hamlet@zulip.com (zulip)"),
                 ],
             )

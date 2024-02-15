@@ -5,6 +5,7 @@ from typing import Any
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError, CommandParser
+from typing_extensions import override
 
 from zerver.data_import.slack import do_convert_data
 
@@ -12,6 +13,7 @@ from zerver.data_import.slack import do_convert_data
 class Command(BaseCommand):
     help = """Convert the Slack data into Zulip data format."""
 
+    @override
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "slack_data_path",
@@ -21,7 +23,7 @@ class Command(BaseCommand):
         )
 
         parser.add_argument(
-            "--token", metavar="<slack_token>", help="Slack legacy token of the organsation"
+            "--token", metavar="<slack_token>", help="Bot user OAuth token, starting xoxb-"
         )
 
         parser.add_argument(
@@ -34,8 +36,15 @@ class Command(BaseCommand):
             help="Threads to use in exporting UserMessage objects in parallel",
         )
 
+        parser.add_argument(
+            "--no-convert-slack-threads",
+            action="store_true",
+            help="If specified, do not convert Slack threads to separate Zulip topics",
+        )
+
         parser.formatter_class = argparse.RawTextHelpFormatter
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         output_dir = options["output_dir"]
         if output_dir is None:
@@ -56,4 +65,11 @@ class Command(BaseCommand):
                 raise CommandError(f"Slack data directory not found: '{path}'")
 
             print("Converting data ...")
-            do_convert_data(path, output_dir, token, threads=num_threads)
+            convert_slack_threads = not options["no_convert_slack_threads"]
+            do_convert_data(
+                path,
+                output_dir,
+                token,
+                threads=num_threads,
+                convert_slack_threads=convert_slack_threads,
+            )

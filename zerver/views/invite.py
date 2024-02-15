@@ -1,33 +1,45 @@
 import re
-from typing import List, Sequence, Set
+from typing import List, Optional, Sequence, Set
 
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext as _
 
-from zerver.decorator import require_member_or_admin, require_realm_admin
-from zerver.lib.actions import (
+from confirmation import settings as confirmation_settings
+from zerver.actions.invites import (
     do_create_multiuse_invite_link,
-    do_get_user_invites,
+    do_get_invites_controlled_by_user,
     do_invite_users,
     do_resend_user_invite_email,
     do_revoke_multi_use_invite,
     do_revoke_user_invite,
 )
-from zerver.lib.exceptions import JsonableError, OrganizationOwnerRequired
+from zerver.decorator import require_member_or_admin
+from zerver.lib.exceptions import JsonableError, OrganizationOwnerRequiredError
 from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
 from zerver.lib.streams import access_stream_by_id
-from zerver.lib.validator import check_int, check_list
+from zerver.lib.validator import check_int, check_int_in, check_list, check_none_or
 from zerver.models import MultiuseInvite, PreregistrationUser, Stream, UserProfile
 
+# Convert INVITATION_LINK_VALIDITY_DAYS into minutes.
+# Because mypy fails to correctly infer the type of the validator, we want this constant
+# to be Optional[int] to avoid a mypy error when using it as the default value.
+# https://github.com/python/mypy/issues/13234
+INVITATION_LINK_VALIDITY_MINUTES: Optional[int] = 24 * 60 * settings.INVITATION_LINK_VALIDITY_DAYS
 
-def check_if_owner_required(invited_as: int, user_profile: UserProfile) -> None:
+
+def check_role_based_permissions(
+    invited_as: int, user_profile: UserProfile, *, require_admin: bool
+) -> None:
     if (
         invited_as == PreregistrationUser.INVITE_AS["REALM_OWNER"]
         and not user_profile.is_realm_owner
     ):
-        raise OrganizationOwnerRequired()
+        raise OrganizationOwnerRequiredError
+
+    if require_admin and not user_profile.is_realm_admin:
+        raise JsonableError(_("Must be an organization administrator"))
 
 
 @require_member_or_admin
@@ -36,33 +48,33 @@ def invite_users_backend(
     request: HttpRequest,
     user_profile: UserProfile,
     invitee_emails_raw: str = REQ("invitee_emails"),
-    invite_expires_in_days: int = REQ(
-        json_validator=check_int, default=settings.INVITATION_LINK_VALIDITY_DAYS
+    invite_expires_in_minutes: Optional[int] = REQ(
+        json_validator=check_none_or(check_int), default=INVITATION_LINK_VALIDITY_MINUTES
     ),
-    invite_as: int = REQ(json_validator=check_int, default=PreregistrationUser.INVITE_AS["MEMBER"]),
+    invite_as: int = REQ(
+        json_validator=check_int_in(
+            list(PreregistrationUser.INVITE_AS.values()),
+        ),
+        default=PreregistrationUser.INVITE_AS["MEMBER"],
+    ),
     stream_ids: List[int] = REQ(json_validator=check_list(check_int)),
 ) -> HttpResponse:
-
-    if not user_profile.can_invite_others_to_realm():
+    if not user_profile.can_invite_users_by_email():
         # Guest users case will not be handled here as it will
         # be handled by the decorator above.
         raise JsonableError(_("Insufficient permission"))
-    if invite_as not in PreregistrationUser.INVITE_AS.values():
-        raise JsonableError(_("Must be invited as an valid type of user"))
-    check_if_owner_required(invite_as, user_profile)
-    if (
-        invite_as
-        in [
-            PreregistrationUser.INVITE_AS["REALM_ADMIN"],
-            PreregistrationUser.INVITE_AS["MODERATOR"],
-        ]
-        and not user_profile.is_realm_admin
-    ):
-        raise JsonableError(_("Must be an organization administrator"))
+
+    require_admin = invite_as in [
+        # Owners can only be invited by owners, checked by separate
+        # logic in check_role_based_permissions.
+        PreregistrationUser.INVITE_AS["REALM_OWNER"],
+        PreregistrationUser.INVITE_AS["REALM_ADMIN"],
+        PreregistrationUser.INVITE_AS["MODERATOR"],
+    ]
+    check_role_based_permissions(invite_as, user_profile, require_admin=require_admin)
+
     if not invitee_emails_raw:
         raise JsonableError(_("You must specify at least one email address."))
-    if not stream_ids:
-        raise JsonableError(_("You must specify at least one stream for invitees to join."))
 
     invitee_emails = get_invitee_emails_set(invitee_emails_raw)
 
@@ -72,18 +84,23 @@ def invite_users_backend(
             (stream, sub) = access_stream_by_id(user_profile, stream_id)
         except JsonableError:
             raise JsonableError(
-                _("Stream does not exist with id: {}. No invites were sent.").format(stream_id)
+                _("Stream does not exist with id: {stream_id}. No invites were sent.").format(
+                    stream_id=stream_id
+                )
             )
         streams.append(stream)
+
+    if len(streams) and not user_profile.can_subscribe_other_users():
+        raise JsonableError(_("You do not have permission to subscribe other users to streams."))
 
     do_invite_users(
         user_profile,
         invitee_emails,
         streams,
-        invite_expires_in_days=invite_expires_in_days,
+        invite_expires_in_minutes=invite_expires_in_minutes,
         invite_as=invite_as,
     )
-    return json_success()
+    return json_success(request)
 
 
 def get_invitee_emails_set(invitee_emails_raw: str) -> Set[str]:
@@ -99,8 +116,8 @@ def get_invitee_emails_set(invitee_emails_raw: str) -> Set[str]:
 
 @require_member_or_admin
 def get_user_invites(request: HttpRequest, user_profile: UserProfile) -> HttpResponse:
-    all_users = do_get_user_invites(user_profile)
-    return json_success({"invites": all_users})
+    all_users = do_get_invites_controlled_by_user(user_profile)
+    return json_success(request, data={"invites": all_users})
 
 
 @require_member_or_admin
@@ -117,20 +134,17 @@ def revoke_user_invite(
         raise JsonableError(_("No such invitation"))
 
     if prereg_user.referred_by_id != user_profile.id:
-        check_if_owner_required(prereg_user.invited_as, user_profile)
-        if not user_profile.is_realm_admin:
-            raise JsonableError(_("Must be an organization administrator"))
+        check_role_based_permissions(prereg_user.invited_as, user_profile, require_admin=True)
 
     do_revoke_user_invite(prereg_user)
-    return json_success()
+    return json_success(request)
 
 
-@require_realm_admin
+@require_member_or_admin
 @has_request_variables
 def revoke_multiuse_invite(
     request: HttpRequest, user_profile: UserProfile, invite_id: int
 ) -> HttpResponse:
-
     try:
         invite = MultiuseInvite.objects.get(id=invite_id)
     except MultiuseInvite.DoesNotExist:
@@ -139,10 +153,14 @@ def revoke_multiuse_invite(
     if invite.realm != user_profile.realm:
         raise JsonableError(_("No such invitation"))
 
-    check_if_owner_required(invite.invited_as, user_profile)
+    if invite.referred_by_id != user_profile.id:
+        check_role_based_permissions(invite.invited_as, user_profile, require_admin=True)
+
+    if invite.status == confirmation_settings.STATUS_REVOKED:
+        raise JsonableError(_("Invitation has already been revoked"))
 
     do_revoke_multi_use_invite(invite)
-    return json_success()
+    return json_success(request)
 
 
 @require_member_or_admin
@@ -161,36 +179,58 @@ def resend_user_invite_email(
         raise JsonableError(_("No such invitation"))
 
     if prereg_user.referred_by_id != user_profile.id:
-        check_if_owner_required(prereg_user.invited_as, user_profile)
-        if not user_profile.is_realm_admin:
-            raise JsonableError(_("Must be an organization administrator"))
+        check_role_based_permissions(prereg_user.invited_as, user_profile, require_admin=True)
 
     timestamp = do_resend_user_invite_email(prereg_user)
-    return json_success({"timestamp": timestamp})
+    return json_success(request, data={"timestamp": timestamp})
 
 
-@require_realm_admin
+@require_member_or_admin
 @has_request_variables
 def generate_multiuse_invite_backend(
     request: HttpRequest,
     user_profile: UserProfile,
-    invite_expires_in_days: int = REQ(
-        json_validator=check_int, default=settings.INVITATION_LINK_VALIDITY_DAYS
+    invite_expires_in_minutes: Optional[int] = REQ(
+        json_validator=check_none_or(check_int), default=INVITATION_LINK_VALIDITY_MINUTES
     ),
-    invite_as: int = REQ(json_validator=check_int, default=PreregistrationUser.INVITE_AS["MEMBER"]),
+    invite_as: int = REQ(
+        json_validator=check_int_in(
+            list(PreregistrationUser.INVITE_AS.values()),
+        ),
+        default=PreregistrationUser.INVITE_AS["MEMBER"],
+    ),
     stream_ids: Sequence[int] = REQ(json_validator=check_list(check_int), default=[]),
 ) -> HttpResponse:
-    check_if_owner_required(invite_as, user_profile)
+    if not user_profile.can_create_multiuse_invite_to_realm():
+        # Guest users case will not be handled here as it will
+        # be handled by the decorator above.
+        raise JsonableError(_("Insufficient permission"))
+
+    require_admin = invite_as in [
+        # Owners can only be invited by owners, checked by separate
+        # logic in check_role_based_permissions.
+        PreregistrationUser.INVITE_AS["REALM_OWNER"],
+        PreregistrationUser.INVITE_AS["REALM_ADMIN"],
+        PreregistrationUser.INVITE_AS["MODERATOR"],
+    ]
+    check_role_based_permissions(invite_as, user_profile, require_admin=require_admin)
 
     streams = []
     for stream_id in stream_ids:
         try:
             (stream, sub) = access_stream_by_id(user_profile, stream_id)
         except JsonableError:
-            raise JsonableError(_("Invalid stream id {}. No invites were sent.").format(stream_id))
+            raise JsonableError(
+                _("Invalid stream ID {stream_id}. No invites were sent.").format(
+                    stream_id=stream_id
+                )
+            )
         streams.append(stream)
 
+    if len(streams) and not user_profile.can_subscribe_other_users():
+        raise JsonableError(_("You do not have permission to subscribe other users to streams."))
+
     invite_link = do_create_multiuse_invite_link(
-        user_profile, invite_as, invite_expires_in_days, streams
+        user_profile, invite_as, invite_expires_in_minutes, streams
     )
-    return json_success({"invite_link": invite_link})
+    return json_success(request, data={"invite_link": invite_link})

@@ -1,19 +1,18 @@
 from typing import Any, Dict, List
 
 from django.core.management.base import BaseCommand
+from typing_extensions import override
 
-from zerver.lib.actions import (
-    bulk_add_subscriptions,
-    do_add_reaction,
-    do_change_avatar_fields,
-    do_create_user,
-    do_send_messages,
-    ensure_stream,
-    internal_prep_stream_message,
-)
-from zerver.lib.emoji import emoji_name_to_emoji_code
+from zerver.actions.create_user import do_create_user
+from zerver.actions.message_send import do_send_messages, internal_prep_stream_message
+from zerver.actions.reactions import do_add_reaction
+from zerver.actions.streams import bulk_add_subscriptions
+from zerver.actions.user_settings import do_change_avatar_fields
+from zerver.lib.emoji import get_emoji_data
+from zerver.lib.streams import ensure_stream
 from zerver.lib.upload import upload_avatar_image
-from zerver.models import Message, UserProfile, get_realm
+from zerver.models import Message, UserProfile
+from zerver.models.realms import get_realm
 
 
 class Command(BaseCommand):
@@ -120,13 +119,15 @@ From image editing program:
             for message in staged_messages
         ]
 
-        message_ids = do_send_messages(messages)
+        message_ids = [
+            sent_message_result.message_id for sent_message_result in do_send_messages(messages)
+        ]
 
         preview_message = Message.objects.get(
             id__in=message_ids, content__icontains="image previews"
         )
-        (emoji_code, reaction_type) = emoji_name_to_emoji_code(realm, "whale")
-        do_add_reaction(starr, preview_message, "whale", emoji_code, reaction_type)
+        whale = get_emoji_data(realm.id, "whale")
+        do_add_reaction(starr, preview_message, "whale", whale.emoji_code, whale.reaction_type)
 
         twitter_message = Message.objects.get(id__in=message_ids, content__icontains="gvanrossum")
         # Setting up a twitter integration in dev is a decent amount of work. If you need
@@ -145,8 +146,11 @@ From image editing program:
 
         # Put a short pause between the whale reaction and this, so that the
         # thumbs_up shows up second
-        (emoji_code, reaction_type) = emoji_name_to_emoji_code(realm, "thumbs_up")
-        do_add_reaction(starr, preview_message, "thumbs_up", emoji_code, reaction_type)
+        thumbs_up = get_emoji_data(realm.id, "thumbs_up")
+        do_add_reaction(
+            starr, preview_message, "thumbs_up", thumbs_up.emoji_code, thumbs_up.reaction_type
+        )
 
+    @override
     def handle(self, *args: Any, **options: str) -> None:
         self.add_message_formatting_conversation()

@@ -6,8 +6,9 @@ from typing import Any, Dict, List, Mapping, Optional
 import markdown
 from markdown.extensions import Extension
 from markdown.preprocessors import Preprocessor
+from typing_extensions import override
 
-from zerver.lib.markdown.preprocessor_priorities import PREPROCESSOR_PRIORITES
+from zerver.lib.markdown.priorities import PREPROCESSOR_PRIORITES
 from zerver.openapi.openapi import check_deprecated_consistency, get_openapi_return_values
 
 from .api_arguments_table_generator import generate_data_type
@@ -16,9 +17,7 @@ REGEXP = re.compile(r"\{generate_return_values_table\|\s*(.+?)\s*\|\s*(.+)\s*\}"
 
 
 class MarkdownReturnValuesTableGenerator(Extension):
-    def __init__(self, configs: Mapping[str, Any] = {}) -> None:
-        self.config: Dict[str, Any] = {}
-
+    @override
     def extendMarkdown(self, md: markdown.Markdown) -> None:
         md.preprocessors.register(
             APIReturnValuesTablePreprocessor(md, self.getConfigs()),
@@ -31,6 +30,7 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
     def __init__(self, md: markdown.Markdown, config: Mapping[str, Any]) -> None:
         super().__init__(md)
 
+    @override
     def run(self, lines: List[str]) -> List[str]:
         done = False
         while not done:
@@ -54,7 +54,7 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
                 else:
                     text = self.render_table(return_values, 0)
                 if len(text) > 0:
-                    text = ["#### Return values"] + text
+                    text = ["#### Return values", *text]
                 line_split = REGEXP.split(line, maxsplit=0)
                 preceding = line_split[0]
                 following = line_split[-1]
@@ -92,7 +92,8 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
                 + ": "
                 + '<span class="api-field-type">'
                 + data_type
-                + "</span> "
+                + "</span>\n\n"
+                + (spacing + 4) * " "
                 + key_description
             )
         return (
@@ -102,12 +103,13 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
             + "`: "
             + '<span class="api-field-type">'
             + data_type
-            + "</span> "
+            + "</span>\n\n"
+            + (spacing + 4) * " "
             + description
         )
 
     def render_table(self, return_values: Dict[str, Any], spacing: int) -> List[str]:
-        IGNORE = ["result", "msg"]
+        IGNORE = ["result", "msg", "ignored_parameters_unsupported"]
         ans = []
         for return_value in return_values:
             if return_value in IGNORE:
@@ -137,7 +139,9 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
                 continue
             description = return_values[return_value]["description"]
             data_type = generate_data_type(return_values[return_value])
-            check_deprecated_consistency(return_values[return_value], description)
+            check_deprecated_consistency(
+                return_values[return_value].get("deprecated", False), description
+            )
             ans.append(self.render_desc(description, spacing, data_type, return_value))
             if "properties" in return_values[return_value]:
                 ans += self.render_table(return_values[return_value]["properties"], spacing + 4)
@@ -155,6 +159,28 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
                         return_values[return_value]["additionalProperties"]["properties"],
                         spacing + 8,
                     )
+                elif return_values[return_value]["additionalProperties"].get(
+                    "additionalProperties", False
+                ):
+                    data_type = generate_data_type(
+                        return_values[return_value]["additionalProperties"]["additionalProperties"]
+                    )
+                    ans.append(
+                        self.render_desc(
+                            return_values[return_value]["additionalProperties"][
+                                "additionalProperties"
+                            ]["description"],
+                            spacing + 8,
+                            data_type,
+                        )
+                    )
+
+                    ans += self.render_table(
+                        return_values[return_value]["additionalProperties"]["additionalProperties"][
+                            "properties"
+                        ],
+                        spacing + 12,
+                    )
             if (
                 "items" in return_values[return_value]
                 and "properties" in return_values[return_value]["items"]
@@ -170,7 +196,7 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
         # Directly using `###` for subheading causes errors so use h3 with made up id.
         argument_template = (
             '<div class="api-argument"><p class="api-argument-name"><h3 id="{h3_id}">'
-            + " {event_type} {op}</h3></p></div> \n{description}\n\n\n"
+            "{event_type} {op}</h3></p></div> \n{description}\n\n\n"
         )
         for events in events_dict["oneOf"]:
             event_type: Dict[str, Any] = events["properties"]["type"]
@@ -201,4 +227,4 @@ class APIReturnValuesTablePreprocessor(Preprocessor):
 
 
 def makeExtension(*args: Any, **kwargs: str) -> MarkdownReturnValuesTableGenerator:
-    return MarkdownReturnValuesTableGenerator(kwargs)
+    return MarkdownReturnValuesTableGenerator(*args, **kwargs)

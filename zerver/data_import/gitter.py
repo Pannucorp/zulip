@@ -1,6 +1,5 @@
 import logging
 import os
-import subprocess
 from typing import Any, Dict, List, Set, Tuple
 
 import dateutil.parser
@@ -8,6 +7,7 @@ import orjson
 from django.conf import settings
 from django.forms.models import model_to_dict
 from django.utils.timezone import now as timezone_now
+from typing_extensions import TypeAlias
 
 from zerver.data_import.import_util import (
     ZerverFieldsT,
@@ -21,14 +21,16 @@ from zerver.data_import.import_util import (
     build_usermessages,
     build_zerver_realm,
     create_converted_data_files,
+    long_term_idle_helper,
     make_subscriber_map,
     process_avatars,
 )
 from zerver.lib.export import MESSAGE_BATCH_CHUNK_SIZE
 from zerver.models import Recipient, UserProfile
+from zproject.backends import GitHubAuthBackend
 
 # stubs
-GitterDataT = List[Dict[str, Any]]
+GitterDataT: TypeAlias = List[Dict[str, Any]]
 
 realm_id = 0
 
@@ -45,7 +47,21 @@ def gitter_workspace_to_realm(
     """
     NOW = float(timezone_now().timestamp())
     zerver_realm: List[ZerverFieldsT] = build_zerver_realm(realm_id, realm_subdomain, NOW, "Gitter")
+
     realm = build_realm(zerver_realm, realm_id, domain_name)
+
+    # Users will have GitHub's generated noreply email addresses so their only way to log in
+    # at first is via GitHub. So we set GitHub to be the only authentication method enabled
+    # default to avoid user confusion.
+    realm["zerver_realmauthenticationmethod"] = [
+        {
+            "name": GitHubAuthBackend.auth_backend_name,
+            "realm": realm_id,
+            # The id doesn't matter since it gets set by the import later properly, but we need to set
+            # it to something in the dict.
+            "id": 1,
+        }
+    ]
 
     zerver_userprofile, avatars, user_map = build_userprofile(int(NOW), domain_name, gitter_data)
     zerver_stream, zerver_defaultstream, stream_map = build_stream_map(int(NOW), gitter_data)
@@ -78,12 +94,15 @@ def build_userprofile(
     user_id = 0
 
     for data in gitter_data:
-        if data["fromUser"]["id"] not in user_map:
+        if get_user_from_message(data) not in user_map:
             user_data = data["fromUser"]
             user_map[user_data["id"]] = user_id
 
             email = get_user_email(user_data, domain_name)
-            build_avatar(user_id, realm_id, email, user_data["avatarUrl"], timestamp, avatar_list)
+            if user_data.get("avatarUrl"):
+                build_avatar(
+                    user_id, realm_id, email, user_data["avatarUrl"], timestamp, avatar_list
+                )
 
             # Build userprofile object
             userprofile = UserProfile(
@@ -197,6 +216,15 @@ def build_recipient_and_subscription(
     return zerver_recipient, zerver_subscription
 
 
+def get_timestamp_from_message(message: ZerverFieldsT) -> float:
+    # Gitter's timestamps are in UTC
+    return float(dateutil.parser.parse(message["sent"]).timestamp())
+
+
+def get_user_from_message(message: ZerverFieldsT) -> str:
+    return message["fromUser"]["id"]
+
+
 def convert_gitter_workspace_messages(
     gitter_data: GitterDataT,
     output_dir: str,
@@ -204,12 +232,24 @@ def convert_gitter_workspace_messages(
     user_map: Dict[str, int],
     stream_map: Dict[str, int],
     user_short_name_to_full_name: Dict[str, str],
+    zerver_userprofile: List[ZerverFieldsT],
+    realm_id: int,
     chunk_size: int = MESSAGE_BATCH_CHUNK_SIZE,
 ) -> None:
     """
     Messages are stored in batches
     """
     logging.info("######### IMPORTING MESSAGES STARTED #########\n")
+
+    long_term_idle = long_term_idle_helper(
+        iter(gitter_data),
+        get_user_from_message,
+        get_timestamp_from_message,
+        lambda id: user_map[id],
+        iter(user_map.keys()),
+        zerver_userprofile,
+    )
+
     message_id = 0
 
     low_index = 0
@@ -224,22 +264,23 @@ def convert_gitter_workspace_messages(
         if len(message_data) == 0:
             break
         for message in message_data:
-            message_time = dateutil.parser.parse(message["sent"]).timestamp()
+            message_time = get_timestamp_from_message(message)
             mentioned_user_ids = get_usermentions(message, user_map, user_short_name_to_full_name)
             rendered_content = None
             topic_name = "imported from Gitter" + (
                 f' room {message["room"]}' if "room" in message else ""
             )
-            user_id = user_map[message["fromUser"]["id"]]
+            user_id = user_map[get_user_from_message(message)]
             recipient_id = stream_map[message["room"]] if "room" in message else 0
             zulip_message = build_message(
-                topic_name,
-                float(message_time),
-                message_id,
-                message["text"],
-                rendered_content,
-                user_id,
-                recipient_id,
+                topic_name=topic_name,
+                date_sent=message_time,
+                message_id=message_id,
+                content=message["text"],
+                rendered_content=rendered_content,
+                user_id=user_id,
+                recipient_id=recipient_id,
+                realm_id=realm_id,
             )
             zerver_message.append(zulip_message)
 
@@ -250,6 +291,7 @@ def convert_gitter_workspace_messages(
                 mentioned_user_ids=mentioned_user_ids,
                 message_id=message_id,
                 is_private=False,
+                long_term_idle=long_term_idle,
             )
 
             message_id += 1
@@ -318,7 +360,14 @@ def do_convert_data(gitter_data_file: str, output_dir: str, threads: int = 6) ->
         user_short_name_to_full_name[userprofile["short_name"]] = userprofile["full_name"]
 
     convert_gitter_workspace_messages(
-        gitter_data, output_dir, subscriber_map, user_map, stream_map, user_short_name_to_full_name
+        gitter_data,
+        output_dir,
+        subscriber_map,
+        user_map,
+        stream_map,
+        user_short_name_to_full_name,
+        realm["zerver_userprofile"],
+        realm_id=realm_id,
     )
 
     avatar_folder = os.path.join(output_dir, "avatars")
@@ -338,8 +387,6 @@ def do_convert_data(gitter_data_file: str, output_dir: str, threads: int = 6) ->
     create_converted_data_files([], output_dir, "/uploads/records.json")
     # IO attachments records
     create_converted_data_files(attachment, output_dir, "/attachment.json")
-
-    subprocess.check_call(["tar", "-czf", output_dir + ".tar.gz", output_dir, "-P"])
 
     logging.info("######### DATA CONVERSION FINISHED #########\n")
     logging.info("Zulip data dump created at %s", output_dir)

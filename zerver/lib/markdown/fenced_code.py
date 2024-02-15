@@ -75,6 +75,7 @@ Dependencies:
 * [Pygments (optional)](http://pygments.org)
 
 """
+
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableSequence, Optional, Sequence
 
@@ -86,9 +87,10 @@ from markdown.extensions.codehilite import CodeHiliteExtension, parse_hl_lines
 from markdown.preprocessors import Preprocessor
 from pygments.lexers import find_lexer_class_by_name
 from pygments.util import ClassNotFound
+from typing_extensions import override
 
-from zerver.lib.exceptions import MarkdownRenderingException
-from zerver.lib.markdown.preprocessor_priorities import PREPROCESSOR_PRIORITES
+from zerver.lib.exceptions import MarkdownRenderingError
+from zerver.lib.markdown.priorities import PREPROCESSOR_PRIORITES
 from zerver.lib.tex import render_tex
 
 # Global vars
@@ -135,9 +137,8 @@ Missing required -X argument in curl command:
 
     for line in lines:
         regex = r'curl [-](sS)?X "?(GET|DELETE|PATCH|POST)"?'
-        if line.startswith("curl"):
-            if re.search(regex, line) is None:
-                raise MarkdownRenderingException(error_msg.format(command=line.strip()))
+        if line.startswith("curl") and re.search(regex, line) is None:
+            raise MarkdownRenderingError(error_msg.format(command=line.strip()))
 
 
 CODE_VALIDATORS: Dict[Optional[str], Callable[[List[str]], None]] = {
@@ -157,6 +158,7 @@ class FencedCodeExtension(Extension):
         for key, value in config.items():
             self.setConfig(key, value)
 
+    @override
     def extendMarkdown(self, md: Markdown) -> None:
         """Add FencedBlockPreprocessor to the Markdown instance."""
         md.registerExtension(self)
@@ -211,7 +213,7 @@ class ZulipBaseHandler:
         """Returns a formatted text.
         Subclasses should override this method.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 def generic_handler(
@@ -269,6 +271,7 @@ class OuterHandler(ZulipBaseHandler):
         self.default_language = default_language
         super().__init__(processor, output)
 
+    @override
     def handle_line(self, line: str) -> None:
         check_for_new_fence(
             self.processor, self.output, line, self.run_content_validators, self.default_language
@@ -288,6 +291,7 @@ class CodeHandler(ZulipBaseHandler):
         self.run_content_validators = run_content_validators
         super().__init__(processor, output, fence)
 
+    @override
     def done(self) -> None:
         # run content validators (if any)
         if self.run_content_validators:
@@ -295,6 +299,7 @@ class CodeHandler(ZulipBaseHandler):
             validator(self.lines)
         super().done()
 
+    @override
     def format_text(self, text: str) -> str:
         return self.processor.format_code(self.lang, text)
 
@@ -310,6 +315,7 @@ class QuoteHandler(ZulipBaseHandler):
         self.default_language = default_language
         super().__init__(processor, output, fence, process_contents=True)
 
+    @override
     def handle_line(self, line: str) -> None:
         if line.rstrip() == self.fence:
             self.done()
@@ -318,6 +324,7 @@ class QuoteHandler(ZulipBaseHandler):
                 self.processor, self.lines, line, default_language=self.default_language
             )
 
+    @override
     def format_text(self, text: str) -> str:
         return self.processor.format_quote(text)
 
@@ -333,17 +340,20 @@ class SpoilerHandler(ZulipBaseHandler):
         self.spoiler_header = spoiler_header
         super().__init__(processor, output, fence, process_contents=True)
 
+    @override
     def handle_line(self, line: str) -> None:
         if line.rstrip() == self.fence:
             self.done()
         else:
             check_for_new_fence(self.processor, self.lines, line)
 
+    @override
     def format_text(self, text: str) -> str:
         return self.processor.format_spoiler(self.spoiler_header, text)
 
 
 class TexHandler(ZulipBaseHandler):
+    @override
     def format_text(self, text: str) -> str:
         return self.processor.format_tex(text)
 
@@ -412,8 +422,11 @@ class FencedBlockPreprocessor(Preprocessor):
     def pop(self) -> None:
         self.handlers.pop()
 
+    @override
     def run(self, lines: Iterable[str]) -> List[str]:
         """Match and store Fenced Code Blocks in the HtmlStash."""
+
+        from zerver.lib.markdown import ZulipMarkdown
 
         output: List[str] = []
 
@@ -421,10 +434,8 @@ class FencedBlockPreprocessor(Preprocessor):
         self.handlers: List[ZulipBaseHandler] = []
 
         default_language = None
-        try:
+        if isinstance(self.md, ZulipMarkdown) and self.md.zulip_realm is not None:
             default_language = self.md.zulip_realm.default_code_block_language
-        except AttributeError:
-            pass
         handler = OuterHandler(processor, output, self.run_content_validators, default_language)
         self.push(handler)
 
@@ -457,7 +468,7 @@ class FencedBlockPreprocessor(Preprocessor):
             self.checked_for_codehilite = True
 
         # If config is not empty, then the codehighlite extension
-        # is enabled, so we call it to highlite the code
+        # is enabled, so we call it to highlight the code
         if self.codehilite_conf:
             highliter = CodeHilite(
                 text,
@@ -466,8 +477,18 @@ class FencedBlockPreprocessor(Preprocessor):
                 css_class=self.codehilite_conf["css_class"][0],
                 style=self.codehilite_conf["pygments_style"][0],
                 use_pygments=self.codehilite_conf["use_pygments"][0],
-                lang=(lang or None),
+                lang=lang or None,
                 noclasses=self.codehilite_conf["noclasses"][0],
+                # By default, the Pygments PHP lexers won't highlight
+                # code without a `<?php` marker at the start of the
+                # code block, which is undesired in the common case of
+                # pasting a snippet of PHP code rather than whole
+                # file. The `startinline` option overrides this
+                # behavior for PHP-descended languages and has no
+                # effect on other lexers.
+                #
+                # See https://pygments.org/docs/lexers/#lexers-for-php-and-related-languages
+                startinline=True,
             )
 
             code = highliter.hilite().rstrip("\n")
@@ -545,7 +566,7 @@ class FencedBlockPreprocessor(Preprocessor):
         return txt
 
 
-def makeExtension(*args: Any, **kwargs: None) -> FencedCodeExtension:
+def makeExtension(*args: Any, **kwargs: Any) -> FencedCodeExtension:
     return FencedCodeExtension(kwargs)
 
 

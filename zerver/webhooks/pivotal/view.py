@@ -1,4 +1,5 @@
 """Webhooks for external integrations."""
+
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,7 +9,7 @@ from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext as _
 
 from zerver.decorator import webhook_view
-from zerver.lib.exceptions import JsonableError, UnsupportedWebhookEventType
+from zerver.lib.exceptions import JsonableError, UnsupportedWebhookEventTypeError
 from zerver.lib.request import has_request_variables
 from zerver.lib.response import json_success
 from zerver.lib.webhooks.common import check_send_webhook_message
@@ -46,10 +47,10 @@ def api_pivotal_webhook_v3(request: HttpRequest, user_profile: UserProfile) -> T
     more_info = f" [(view)]({url})."
 
     if event_type == "story_update":
-        subject = name
+        topic_name = name
         content = description + more_info
     elif event_type == "note_create":
-        subject = "Comment added"
+        topic_name = "Comment added"
         content = description + more_info
     elif event_type == "story_create":
         issue_desc = get_text(["stories", "story", "description"])
@@ -58,9 +59,9 @@ def api_pivotal_webhook_v3(request: HttpRequest, user_profile: UserProfile) -> T
         estimate = get_text(["stories", "story", "estimate"])
         if estimate != "":
             estimate = f" worth {estimate} story points"
-        subject = name
+        topic_name = name
         content = f"{description} ({issue_status} {issue_type}{estimate}):\n\n~~~ quote\n{issue_desc}\n~~~\n\n{more_info}"
-    return subject, content, f"{event_type}_v3"
+    return topic_name, content, f"{event_type}_v3"
 
 
 UNSUPPORTED_EVENT_TYPES = [
@@ -107,7 +108,7 @@ def api_pivotal_webhook_v5(request: HttpRequest, user_profile: UserProfile) -> T
     changes = payload.get("changes", [])
 
     content = ""
-    subject = f"#{story_id}: {story_name}"
+    topic_name = f"#{story_id}: {story_name}"
 
     def extract_comment(change: Dict[str, Any]) -> Optional[str]:
         if change.get("kind") == "comment":
@@ -170,23 +171,23 @@ def api_pivotal_webhook_v5(request: HttpRequest, user_profile: UserProfile) -> T
         # Known but unsupported Pivotal event types
         pass
     else:
-        raise UnsupportedWebhookEventType(event_type)
+        raise UnsupportedWebhookEventTypeError(event_type)
 
-    return subject, content, f"{event_type}_v5"
+    return topic_name, content, f"{event_type}_v5"
 
 
 @webhook_view("Pivotal", all_event_types=ALL_EVENT_TYPES)
 @has_request_variables
 def api_pivotal_webhook(request: HttpRequest, user_profile: UserProfile) -> HttpResponse:
-    subject = content = None
+    topic_name = content = None
     try:
-        subject, content, event_type = api_pivotal_webhook_v3(request, user_profile)
+        topic_name, content, event_type = api_pivotal_webhook_v3(request, user_profile)
     except Exception:
         # Attempt to parse v5 JSON payload
-        subject, content, event_type = api_pivotal_webhook_v5(request, user_profile)
+        topic_name, content, event_type = api_pivotal_webhook_v5(request, user_profile)
 
     if not content:
         raise JsonableError(_("Unable to handle Pivotal payload"))
 
-    check_send_webhook_message(request, user_profile, subject, content, event_type)
-    return json_success()
+    check_send_webhook_message(request, user_profile, topic_name, content, event_type)
+    return json_success(request)

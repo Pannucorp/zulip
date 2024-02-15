@@ -29,7 +29,7 @@ First a bit of terminology:
 ### Recipient bar: message you clicked
 
 If you enter a narrow by clicking on a message group's _recipient bar_
-(stream/topic or private message recipient list at the top of a group
+(stream/topic or direct message recipient list at the top of a group
 of messages), Zulip will select the message you clicked on. This
 provides a nice user experience where you get to see the stuff near
 what you clicked on, and in fact the message you clicked on stays at
@@ -45,7 +45,7 @@ will instead select the first unread message matching that narrow, or
 if there are none, the most recent messages matching that narrow.
 
 This provides the nice user experience of taking you to the start of
-the new stuff (with enough messages you'ev seen before still in view
+the new stuff (with enough messages you've seen before still in view
 at the top to provide you with context), which is usually what you
 want. (When finding the "first unread message", Zulip ignores unread
 messages in muted streams or in muted topics within non-muted

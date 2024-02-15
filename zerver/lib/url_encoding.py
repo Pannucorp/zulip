@@ -1,13 +1,16 @@
 from typing import Any, Dict, List
 from urllib.parse import quote, urlsplit
 
+import re2
+
 from zerver.lib.topic import get_topic_from_message_info
+from zerver.lib.types import UserDisplayRecipient
 from zerver.models import Realm, Stream, UserProfile
 
 
 def hash_util_encode(string: str) -> str:
-    # Do the same encoding operation as hash_util.encodeHashComponent on the
-    # frontend.
+    # Do the same encoding operation as shared internal_url.encodeHashComponent
+    # on the frontend.
     # `safe` has a default value of "/", but we want those encoded, too.
     return quote(string, safe=b"").replace(".", "%2E").replace("%", ".")
 
@@ -18,16 +21,18 @@ def encode_stream(stream_id: int, stream_name: str) -> str:
     return str(stream_id) + "-" + hash_util_encode(stream_name)
 
 
-def personal_narrow_url(realm: Realm, sender: UserProfile) -> str:
-    base_url = f"{realm.uri}/#narrow/pm-with/"
-    email_user = sender.email.split("@")[0].lower()
-    pm_slug = str(sender.id) + "-" + hash_util_encode(email_user)
+def personal_narrow_url(*, realm: Realm, sender: UserProfile) -> str:
+    base_url = f"{realm.uri}/#narrow/dm/"
+    encoded_user_name = re2.sub(r'[ "%\/<>`\p{C}]+', "-", sender.full_name)
+    pm_slug = str(sender.id) + "-" + encoded_user_name
     return base_url + pm_slug
 
 
-def huddle_narrow_url(realm: Realm, other_user_ids: List[int]) -> str:
+def huddle_narrow_url(*, user: UserProfile, display_recipient: List[UserDisplayRecipient]) -> str:
+    realm = user.realm
+    other_user_ids = [r["id"] for r in display_recipient if r["id"] != user.id]
     pm_slug = ",".join(str(user_id) for user_id in sorted(other_user_ids)) + "-group"
-    base_url = f"{realm.uri}/#narrow/pm-with/"
+    base_url = f"{realm.uri}/#narrow/dm/"
     return base_url + pm_slug
 
 
@@ -36,13 +41,12 @@ def stream_narrow_url(realm: Realm, stream: Stream) -> str:
     return base_url + encode_stream(stream.id, stream.name)
 
 
-def topic_narrow_url(realm: Realm, stream: Stream, topic: str) -> str:
+def topic_narrow_url(*, realm: Realm, stream: Stream, topic_name: str) -> str:
     base_url = f"{realm.uri}/#narrow/stream/"
-    return f"{base_url}{encode_stream(stream.id, stream.name)}/topic/{hash_util_encode(topic)}"
+    return f"{base_url}{encode_stream(stream.id, stream.name)}/topic/{hash_util_encode(topic_name)}"
 
 
 def near_message_url(realm: Realm, message: Dict[str, Any]) -> str:
-
     if message["type"] == "stream":
         url = near_stream_message_url(
             realm=realm,
@@ -62,7 +66,7 @@ def near_stream_message_url(realm: Realm, message: Dict[str, Any]) -> str:
     stream_id = message["stream_id"]
     stream_name = message["display_recipient"]
     topic_name = get_topic_from_message_info(message)
-    encoded_topic = hash_util_encode(topic_name)
+    encoded_topic_name = hash_util_encode(topic_name)
     encoded_stream = encode_stream(stream_id=stream_id, stream_name=stream_name)
 
     parts = [
@@ -71,7 +75,7 @@ def near_stream_message_url(realm: Realm, message: Dict[str, Any]) -> str:
         "stream",
         encoded_stream,
         "topic",
-        encoded_topic,
+        encoded_topic_name,
         "near",
         message_id,
     ]
@@ -90,7 +94,7 @@ def near_pm_message_url(realm: Realm, message: Dict[str, Any]) -> str:
     parts = [
         realm.uri,
         "#narrow",
-        "pm-with",
+        "dm",
         pm_str,
         "near",
         message_id,

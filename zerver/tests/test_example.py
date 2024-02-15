@@ -1,24 +1,20 @@
-import datetime
-from typing import Any, List, Mapping
+from datetime import timedelta
 from unittest import mock
 
 import orjson
+import time_machine
 from django.utils.timezone import now as timezone_now
 
-from zerver.lib.actions import do_change_can_create_users, do_change_user_role
+from zerver.actions.users import do_change_can_create_users, do_change_user_role
 from zerver.lib.exceptions import JsonableError
 from zerver.lib.streams import access_stream_for_send_message
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.test_helpers import most_recent_message, queries_captured
+from zerver.lib.test_helpers import most_recent_message
 from zerver.lib.users import is_administrator_role
-from zerver.models import (
-    UserProfile,
-    UserStatus,
-    get_display_recipient,
-    get_realm,
-    get_stream,
-    get_user_by_delivery_email,
-)
+from zerver.models import UserProfile, UserStatus
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_stream
+from zerver.models.users import get_user_by_delivery_email
 
 
 # Most Zulip tests use ZulipTestCase, which inherits from django.test.TestCase.
@@ -128,6 +124,7 @@ class TestFullStack(ZulipTestCase):
                 avatar_url=content["user"]["avatar_url"],
                 avatar_version=1,
                 date_joined=content["user"]["date_joined"],
+                delivery_email=None,
                 email=cordelia.email,
                 full_name=cordelia.full_name,
                 is_active=True,
@@ -137,7 +134,7 @@ class TestFullStack(ZulipTestCase):
                 is_guest=False,
                 is_owner=False,
                 role=UserProfile.ROLE_MEMBER,
-                timezone="",
+                timezone="Etc/UTC",
                 user_id=cordelia.id,
             ),
         )
@@ -196,7 +193,7 @@ class TestFullStack(ZulipTestCase):
 
         # We often use assert_json_error for negative tests.
         result = self.client_post("/json/users", valid_params)
-        self.assert_json_error(result, "User not authorized for this query", 400)
+        self.assert_json_error(result, "User not authorized to create users", 400)
 
         do_change_can_create_users(iago, True)
         incomplete_params = dict(
@@ -229,11 +226,8 @@ class TestFullStack(ZulipTestCase):
 
         params = dict(status_text="on vacation")
 
-        events: List[Mapping[str, Any]] = []
-
-        # Use the tornado_redirected_to_list context manager to capture
-        # events.
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        # Use the capture_send_event_calls context manager to capture events.
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(cordelia, "/api/v1/users/me/status", params)
 
         self.assert_json_success(result)
@@ -332,7 +326,7 @@ class TestMessageHelpers(ZulipTestCase):
         # extended to send multiple similar messages.
         self.assertEqual(iago_message.id, sent_message_id)
         self.assertEqual(iago_message.sender_id, hamlet.id)
-        self.assertEqual(get_display_recipient(iago_message.recipient), "Denmark")
+        self.assert_message_stream_name(iago_message, "Denmark")
         self.assertEqual(iago_message.topic_name(), "lunch")
         self.assertEqual(iago_message.content, "I want pizza!")
 
@@ -357,8 +351,8 @@ class TestQueryCounts(ZulipTestCase):
     def test_capturing_queries(self) -> None:
         # It's a common pitfall in Django to accidentally perform
         # database queries in a loop, due to lazy evaluation of
-        # foreign keys. We use the queries_captured context manager to
-        # ensure our query count is predictable.
+        # foreign keys. We use the assert_database_query_count
+        # context manager to ensure our query count is predictable.
         #
         # When a test containing one of these query count assertions
         # fails, we'll want to understand the new queries and whether
@@ -368,15 +362,12 @@ class TestQueryCounts(ZulipTestCase):
         hamlet = self.example_user("hamlet")
         cordelia = self.example_user("cordelia")
 
-        with queries_captured() as queries:
+        with self.assert_database_query_count(15):
             self.send_personal_message(
                 from_user=hamlet,
                 to_user=cordelia,
                 content="hello there!",
             )
-
-        # The assert_length helper is another useful extra from ZulipTestCase.
-        self.assert_length(queries, 16)
 
 
 class TestDevelopmentEmailsLog(ZulipTestCase):
@@ -401,27 +392,28 @@ class TestDevelopmentEmailsLog(ZulipTestCase):
         # https://docs.python.org/3/library/unittest.html#unittest.TestCase.assertLogs
         with self.settings(EMAIL_BACKEND="zproject.email_backends.EmailLogBackEnd"), self.settings(
             DEVELOPMENT_LOG_EMAILS=True
-        ), self.assertLogs(level="INFO") as logger:
-
+        ), self.assertLogs(level="INFO") as logger, mock.patch(
+            "zproject.email_backends.EmailLogBackEnd._do_send_messages", lambda *args: 1
+        ):
             result = self.client_get(
                 "/emails/generate/"
             )  # Generates emails and redirects to /emails/
             self.assertEqual("/emails/", result["Location"])  # Make sure redirect URL is correct.
 
-            # The above call to /emails/generate/ creates 15 emails and
+            # The above call to /emails/generate/ creates the emails and
             # logs the below line for every email.
             output_log = (
                 "INFO:root:Emails sent in development are available at http://testserver/emails"
             )
             # logger.output is a list of all the log messages captured. Verify it is as expected.
-            self.assertEqual(logger.output, [output_log] * 15)
+            self.assertEqual(logger.output, [output_log] * 18)
 
             # Now, lets actually go the URL the above call redirects to, i.e., /emails/
             result = self.client_get(result["Location"])
 
             # assert_in_success_response() is another helper that is commonly used to ensure
             # we are on the right page by verifying a string exists in the page's content.
-            self.assert_in_success_response(["All the emails sent in the Zulip"], result)
+            self.assert_in_success_response(["All emails sent in the Zulip"], result)
 
 
 class TestMocking(ZulipTestCase):
@@ -494,19 +486,16 @@ class TestMocking(ZulipTestCase):
         # that is beyond the limit.
         #
         # Notice how mock.patch() is used here to do exactly the above mentioned.
-        # mock.patch() here makes any calls to `timezone_now` in `zerver.lib.actions`
+        # mock.patch() here makes any calls to `timezone_now` in `zerver.actions.message_edit`
         # to return the value passed to `return_value` in the its context.
         # You can also use mock.patch() as a decorator depending on the
         # requirements. Read more at the documentation link provided above.
 
-        time_beyond_edit_limit = message_sent_time + datetime.timedelta(
+        time_beyond_edit_limit = message_sent_time + timedelta(
             seconds=MESSAGE_CONTENT_EDIT_LIMIT + 100
         )  # There's a buffer time applied to the limit, hence the extra 100s.
 
-        with mock.patch(
-            "zerver.lib.actions.timezone_now",
-            return_value=time_beyond_edit_limit,
-        ):
+        with time_machine.travel(time_beyond_edit_limit, tick=False):
             result = self.client_patch(
                 f"/json/messages/{sent_message_id}", {"content": "I actually want pizza."}
             )

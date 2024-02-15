@@ -16,22 +16,26 @@ import markdown
 from django.conf import settings
 from markdown.extensions import Extension
 from markdown.preprocessors import Preprocessor
+from typing_extensions import override
 
 import zerver.openapi.python_examples
-from zerver.lib.markdown.preprocessor_priorities import PREPROCESSOR_PRIORITES
+from zerver.lib.markdown.priorities import PREPROCESSOR_PRIORITES
 from zerver.openapi.openapi import (
+    NO_EXAMPLE,
+    Parameter,
     check_additional_imports,
     check_requires_administrator,
     generate_openapi_fixture,
     get_curl_include_exclude,
     get_openapi_description,
+    get_openapi_parameters,
     get_openapi_summary,
     get_parameters_description,
     get_responses_description,
     openapi_spec,
 )
 
-API_ENDPOINT_NAME = r"/[a-z_/-{}]+:[a-z]+"
+API_ENDPOINT_NAME = r"/[a-z_\-/-{}]+:[a-z]+"
 API_LANGUAGE = r"\w+"
 API_KEY_TYPE = r"fixture|example"
 MACRO_REGEXP = re.compile(
@@ -49,8 +53,7 @@ MACRO_REGEXP = re.compile(
 )
 PYTHON_EXAMPLE_REGEX = re.compile(r"\# \{code_example\|\s*(start|end)\s*\}")
 JS_EXAMPLE_REGEX = re.compile(r"\/\/ \{code_example\|\s*(start|end)\s*\}")
-MACRO_REGEXP_DESC = re.compile(rf"{{generate_api_description\(\s*({API_ENDPOINT_NAME})\s*\)}}")
-MACRO_REGEXP_TITLE = re.compile(rf"{{generate_api_title\(\s*({API_ENDPOINT_NAME})\s*\)}}")
+MACRO_REGEXP_HEADER = re.compile(rf"{{generate_api_header\(\s*({API_ENDPOINT_NAME})\s*\)}}")
 MACRO_REGEXP_RESPONSE_DESC = re.compile(
     rf"{{generate_response_description\(\s*({API_ENDPOINT_NAME})\s*\)}}"
 )
@@ -142,7 +145,7 @@ def render_python_code_example(
     endpoint, endpoint_method = function.split(":")
     extra_imports = check_additional_imports(endpoint, endpoint_method)
     if extra_imports:
-        extra_imports = sorted(extra_imports + ["zulip"])
+        extra_imports = sorted([*extra_imports, "zulip"])
         extra_imports = [f"import {each_import}" for each_import in extra_imports]
         config_string = config_string.replace("import zulip", "\n".join(extra_imports))
 
@@ -150,26 +153,22 @@ def render_python_code_example(
 
     snippets = extract_code_example(function_source_lines, [], PYTHON_EXAMPLE_REGEX)
 
-    code_example = ["{tab|python}\n"]
-    code_example.append("```python")
-    code_example.extend(config)
-
-    for snippet in snippets:
-        for line in snippet:
-            # Remove one level of indentation and strip newlines
-            code_example.append(line[4:].rstrip())
-
-    code_example.append("print(result)")
-    code_example.append("\n")
-    code_example.append("```")
-
-    return code_example
+    return [
+        "{tab|python}\n",
+        "```python",
+        *config,
+        # Remove one level of indentation and strip newlines
+        *(line[4:].rstrip() for snippet in snippets for line in snippet),
+        "print(result)",
+        "\n",
+        "```",
+    ]
 
 
 def render_javascript_code_example(
     function: str, admin_config: bool = False, **kwargs: Any
 ) -> List[str]:
-    pattern = fr'^add_example\(\s*"[^"]*",\s*{re.escape(json.dumps(function))},\s*\d+,\s*async \(client, console\) => \{{\n(.*?)^(?:\}}| *\}},\n)\);$'
+    pattern = rf'^add_example\(\s*"[^"]*",\s*{re.escape(json.dumps(function))},\s*\d+,\s*async \(client, console\) => \{{\n(.*?)^(?:\}}| *\}},\n)\);$'
     with open("zerver/openapi/javascript_examples.js") as f:
         m = re.search(pattern, f.read(), re.M | re.S)
     if m is None:
@@ -194,9 +193,8 @@ def render_javascript_code_example(
     code_example.append("    const client = await zulipInit(config);")
     for snippet in snippets:
         code_example.append("")
-        for line in snippet:
-            # Strip newlines
-            code_example.append("    " + line.rstrip())
+        # Strip newlines
+        code_example.extend("    " + line.rstrip() for line in snippet)
     code_example.append("})();")
 
     code_example.append("```")
@@ -222,46 +220,45 @@ def curl_method_arguments(endpoint: str, method: str, api_url: str) -> List[str]
 
 
 def get_openapi_param_example_value_as_string(
-    endpoint: str, method: str, param: Dict[str, Any], curl_argument: bool = False
+    endpoint: str, method: str, parameter: Parameter, curl_argument: bool = False
 ) -> str:
-    jsonify = False
-    param_name = param["name"]
-    if "content" in param:
-        param = param["content"]["application/json"]
-        jsonify = True
-    if "type" in param["schema"]:
-        param_type = param["schema"]["type"]
+    if "type" in parameter.value_schema:
+        param_type = parameter.value_schema["type"]
     else:
         # Hack: Ideally, we'd extract a common function for handling
         # oneOf values in types and do something with the resulting
         # union type.  But for this logic's purpose, it's good enough
         # to just check the first parameter.
-        param_type = param["schema"]["oneOf"][0]["type"]
+        param_type = parameter.value_schema["oneOf"][0]["type"]
 
     if param_type in ["object", "array"]:
-        example_value = param.get("example", None)
-        if not example_value:
+        if parameter.example is NO_EXAMPLE:
             msg = f"""All array and object type request parameters must have
 concrete examples. The openAPI documentation for {endpoint}/{method} is missing an example
-value for the {param_name} parameter. Without this we cannot automatically generate a
+value for the {parameter.name} parameter. Without this we cannot automatically generate a
 cURL example."""
             raise ValueError(msg)
-        ordered_ex_val_str = json.dumps(example_value, sort_keys=True)
+        ordered_ex_val_str = json.dumps(parameter.example, sort_keys=True)
         # We currently don't have any non-JSON encoded arrays.
-        assert jsonify
+        assert parameter.json_encoded
         if curl_argument:
-            return "    --data-urlencode " + shlex.quote(f"{param_name}={ordered_ex_val_str}")
+            return "    --data-urlencode " + shlex.quote(f"{parameter.name}={ordered_ex_val_str}")
         return ordered_ex_val_str  # nocoverage
     else:
-        example_value = param.get("example", DEFAULT_EXAMPLE[param_type])
-        if isinstance(example_value, bool):
-            # Booleans are effectively JSON-encoded, in that we pass
-            # true/false, not the Python str(True) = "True"
-            jsonify = True
-        if jsonify:
+        if parameter.example is NO_EXAMPLE:
+            example_value = DEFAULT_EXAMPLE[param_type]
+        else:
+            example_value = parameter.example
+
+        # Booleans are effectively JSON-encoded, in that we pass
+        # true/false, not the Python str(True) = "True"
+        if parameter.json_encoded or isinstance(example_value, (bool, float, int)):
             example_value = json.dumps(example_value)
+        else:
+            assert isinstance(example_value, str)
+
         if curl_argument:
-            return "    --data-urlencode " + shlex.quote(f"{param_name}={example_value}")
+            return "    --data-urlencode " + shlex.quote(f"{parameter.name}={example_value}")
         return example_value
 
 
@@ -274,33 +271,32 @@ def generate_curl_example(
     exclude: Optional[List[str]] = None,
     include: Optional[List[str]] = None,
 ) -> List[str]:
-
     lines = ["```curl"]
     operation = endpoint + ":" + method.lower()
     operation_entry = openapi_spec.openapi()["paths"][endpoint][method.lower()]
     global_security = openapi_spec.openapi()["security"]
 
-    operation_params = operation_entry.get("parameters", [])
+    parameters = get_openapi_parameters(endpoint, method)
     operation_request_body = operation_entry.get("requestBody", None)
     operation_security = operation_entry.get("security", None)
 
     if settings.RUNNING_OPENAPI_CURL_TEST:  # nocoverage
         from zerver.openapi.curl_param_value_generators import patch_openapi_example_values
 
-        operation_params, operation_request_body = patch_openapi_example_values(
-            operation, operation_params, operation_request_body
+        parameters, operation_request_body = patch_openapi_example_values(
+            operation, parameters, operation_request_body
         )
 
     format_dict = {}
-    for param in operation_params:
-        if param["in"] != "path":
+    for parameter in parameters:
+        if parameter.kind != "path":
             continue
-        example_value = get_openapi_param_example_value_as_string(endpoint, method, param)
-        format_dict[param["name"]] = example_value
+        example_value = get_openapi_param_example_value_as_string(endpoint, method, parameter)
+        format_dict[parameter.name] = example_value
     example_endpoint = endpoint.format_map(format_dict)
 
     curl_first_line_parts = ["curl", *curl_method_arguments(example_endpoint, method, api_url)]
-    lines.append(" ".join(map(shlex.quote, curl_first_line_parts)))
+    lines.append(shlex.join(curl_first_line_parts))
 
     insecure_operations = ["/dev_fetch_api_key:post", "/fetch_api_key:post"]
     if operation_security is None:
@@ -308,16 +304,14 @@ def generate_curl_example(
             authentication_required = True
         else:
             raise AssertionError(
-                "Unhandled global securityScheme."
-                + " Please update the code to handle this scheme."
+                "Unhandled global securityScheme. Please update the code to handle this scheme."
             )
     elif operation_security == []:
         if operation in insecure_operations:
             authentication_required = False
         else:
             raise AssertionError(
-                "Unknown operation without a securityScheme. "
-                + "Please update insecure_operations."
+                "Unknown operation without a securityScheme. Please update insecure_operations."
             )
     else:
         raise AssertionError(
@@ -327,26 +321,25 @@ def generate_curl_example(
     if authentication_required:
         lines.append("    -u " + shlex.quote(f"{auth_email}:{auth_api_key}"))
 
-    for param in operation_params:
-        if param["in"] == "path":
-            continue
-        param_name = param["name"]
-
-        if include is not None and param_name not in include:
+    for parameter in parameters:
+        if parameter.kind == "path":
             continue
 
-        if exclude is not None and param_name in exclude:
+        if include is not None and parameter.name not in include:
+            continue
+
+        if exclude is not None and parameter.name in exclude:
             continue
 
         example_value = get_openapi_param_example_value_as_string(
-            endpoint, method, param, curl_argument=True
+            endpoint, method, parameter, curl_argument=True
         )
         lines.append(example_value)
 
-    if "requestBody" in operation_entry:
-        properties = operation_entry["requestBody"]["content"]["multipart/form-data"]["schema"][
-            "properties"
-        ]
+    if "requestBody" in operation_entry and "multipart/form-data" in (
+        content := operation_entry["requestBody"]["content"]
+    ):
+        properties = content["multipart/form-data"]["schema"]["properties"]
         for key, property in properties.items():
             lines.append("    -F " + shlex.quote("{}=@{}".format(key, property["example"])))
 
@@ -413,6 +406,7 @@ class APIMarkdownExtension(Extension):
             ],
         }
 
+    @override
     def extendMarkdown(self, md: markdown.Markdown) -> None:
         md.preprocessors.register(
             APICodeExamplesPreprocessor(md, self.getConfigs()),
@@ -420,14 +414,9 @@ class APIMarkdownExtension(Extension):
             PREPROCESSOR_PRIORITES["generate_code_example"],
         )
         md.preprocessors.register(
-            APIDescriptionPreprocessor(md, self.getConfigs()),
-            "generate_api_description",
-            PREPROCESSOR_PRIORITES["generate_api_description"],
-        )
-        md.preprocessors.register(
-            APITitlePreprocessor(md, self.getConfigs()),
-            "generate_api_title",
-            PREPROCESSOR_PRIORITES["generate_api_title"],
+            APIHeaderPreprocessor(md, self.getConfigs()),
+            "generate_api_header",
+            PREPROCESSOR_PRIORITES["generate_api_header"],
         )
         md.preprocessors.register(
             ResponseDescriptionPreprocessor(md, self.getConfigs()),
@@ -443,12 +432,13 @@ class APIMarkdownExtension(Extension):
 
 class BasePreprocessor(Preprocessor):
     def __init__(
-        self, REGEXP: Pattern[str], md: markdown.Markdown, config: Mapping[str, Any]
+        self, regexp: Pattern[str], md: markdown.Markdown, config: Mapping[str, Any]
     ) -> None:
         super().__init__(md)
         self.api_url = config["api_url"]
-        self.REGEXP = REGEXP
+        self.REGEXP = regexp
 
+    @override
     def run(self, lines: List[str]) -> List[str]:
         done = False
         while not done:
@@ -486,6 +476,7 @@ class APICodeExamplesPreprocessor(BasePreprocessor):
     def __init__(self, md: markdown.Markdown, config: Mapping[str, Any]) -> None:
         super().__init__(MACRO_REGEXP, md, config)
 
+    @override
     def generate_text(self, match: Match[str]) -> List[str]:
         language = match.group(1) or ""
         function = match.group(2)
@@ -505,61 +496,51 @@ class APICodeExamplesPreprocessor(BasePreprocessor):
             )
         return text
 
+    @override
     def render(self, function: str) -> List[str]:
         path, method = function.rsplit(":", 1)
         return generate_openapi_fixture(path, method)
 
 
-class APIDescriptionPreprocessor(BasePreprocessor):
+class APIHeaderPreprocessor(BasePreprocessor):
     def __init__(self, md: markdown.Markdown, config: Mapping[str, Any]) -> None:
-        super().__init__(MACRO_REGEXP_DESC, md, config)
+        super().__init__(MACRO_REGEXP_HEADER, md, config)
 
+    @override
     def render(self, function: str) -> List[str]:
-        description: List[str] = []
-        path, method = function.rsplit(":", 1)
-        description_dict = get_openapi_description(path, method)
-        description_dict = description_dict.replace("{{api_url}}", self.api_url)
-        description.extend(description_dict.splitlines())
-        return description
-
-
-class APITitlePreprocessor(BasePreprocessor):
-    def __init__(self, md: markdown.Markdown, config: Mapping[str, Any]) -> None:
-        super().__init__(MACRO_REGEXP_TITLE, md, config)
-
-    def render(self, function: str) -> List[str]:
-        title: List[str] = []
         path, method = function.rsplit(":", 1)
         raw_title = get_openapi_summary(path, method)
-        title.extend(raw_title.splitlines())
-        title = ["# " + line for line in title]
-        if check_requires_administrator(path, method):
-            title.append("{!api-admin-only.md!}")
-        return title
+        description_dict = get_openapi_description(path, method)
+        return [
+            *("# " + line for line in raw_title.splitlines()),
+            *(["{!api-admin-only.md!}"] if check_requires_administrator(path, method) else []),
+            "",
+            f"`{method.upper()} {self.api_url}/v1{path}`",
+            "",
+            *description_dict.splitlines(),
+        ]
 
 
 class ResponseDescriptionPreprocessor(BasePreprocessor):
     def __init__(self, md: markdown.Markdown, config: Mapping[str, Any]) -> None:
         super().__init__(MACRO_REGEXP_RESPONSE_DESC, md, config)
 
+    @override
     def render(self, function: str) -> List[str]:
-        description: List[str] = []
         path, method = function.rsplit(":", 1)
         raw_description = get_responses_description(path, method)
-        description.extend(raw_description.splitlines())
-        return description
+        return raw_description.splitlines()
 
 
 class ParameterDescriptionPreprocessor(BasePreprocessor):
     def __init__(self, md: markdown.Markdown, config: Mapping[str, Any]) -> None:
         super().__init__(MACRO_REGEXP_PARAMETER_DESC, md, config)
 
+    @override
     def render(self, function: str) -> List[str]:
-        description: List[str] = []
         path, method = function.rsplit(":", 1)
         raw_description = get_parameters_description(path, method)
-        description.extend(raw_description.splitlines())
-        return description
+        return raw_description.splitlines()
 
 
 def makeExtension(*args: Any, **kwargs: str) -> APIMarkdownExtension:

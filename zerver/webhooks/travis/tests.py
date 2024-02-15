@@ -1,4 +1,6 @@
-import urllib
+from urllib.parse import urlencode
+
+from typing_extensions import override
 
 from zerver.lib.test_classes import WebhookTestCase
 
@@ -7,7 +9,7 @@ class TravisHookTests(WebhookTestCase):
     STREAM_NAME = "travis"
     URL_TEMPLATE = "/api/v1/external/travis?stream={stream}&api_key={api_key}"
     WEBHOOK_DIR_NAME = "travis"
-    TOPIC = "builds"
+    TOPIC_NAME = "builds"
     EXPECTED_MESSAGE = """
 Author: josh_mandel
 Build status: Passed :thumbs_up:
@@ -24,7 +26,7 @@ Details: [changes](https://github.com/hl7-fhir/fhir-svn/compare/6dccb98bcfd9...6
 
         self.check_webhook(
             "build",
-            self.TOPIC,
+            self.TOPIC_NAME,
             self.EXPECTED_MESSAGE,
             content_type="application/x-www-form-urlencoded",
         )
@@ -39,7 +41,7 @@ Details: [changes](https://github.com/hl7-fhir/fhir-svn/compare/6dccb98bcfd9...6
 
         self.check_webhook(
             "pull_request",
-            self.TOPIC,
+            self.TOPIC_NAME,
             self.EXPECTED_MESSAGE,
             content_type="application/x-www-form-urlencoded",
         )
@@ -49,7 +51,7 @@ Details: [changes](https://github.com/hl7-fhir/fhir-svn/compare/6dccb98bcfd9...6
 
         self.check_webhook(
             "build",
-            self.TOPIC,
+            self.TOPIC_NAME,
             self.EXPECTED_MESSAGE,
             content_type="application/x-www-form-urlencoded",
         )
@@ -72,12 +74,12 @@ Details: [changes](https://github.com/hl7-fhir/fhir-svn/compare/6dccb98bcfd9...6
             expect_noop=True,
         )
 
-    def test_travis_exlude_push_event_sent(self) -> None:
+    def test_travis_exclude_push_event_sent(self) -> None:
         self.url = f'{self.build_webhook_url()}&exclude_events=["push"]&ignore_pull_requests=false'
 
         self.check_webhook(
             "pull_request",
-            self.TOPIC,
+            self.TOPIC_NAME,
             self.EXPECTED_MESSAGE,
             content_type="application/x-www-form-urlencoded",
         )
@@ -87,14 +89,14 @@ Details: [changes](https://github.com/hl7-fhir/fhir-svn/compare/6dccb98bcfd9...6
 
         self.check_webhook(
             "pull_request",
-            self.TOPIC,
+            self.TOPIC_NAME,
             self.EXPECTED_MESSAGE,
             content_type="application/x-www-form-urlencoded",
         )
 
         self.check_webhook(
             "build",
-            self.TOPIC,
+            self.TOPIC_NAME,
             self.EXPECTED_MESSAGE,
             content_type="application/x-www-form-urlencoded",
         )
@@ -114,25 +116,6 @@ Details: [changes](https://github.com/hl7-fhir/fhir-svn/compare/6dccb98bcfd9...6
             expect_noop=True,
         )
 
-    def test_travis_invalid_event(self) -> None:
-        payload = self.get_body("build")
-        payload = payload.replace("push", "invalid_event")
-        expected_error_messsage = """
-Error: This test triggered a message using the event "invalid_event", which was not properly
-registered via the @webhook_view(..., event_types=[...]). These registrations are important for Zulip
-self-documenting the supported event types for this integration.
-
-You can fix this by adding "invalid_event" to ALL_EVENT_TYPES for this webhook.
-""".strip()
-        with self.assertLogs("django.request"):
-            with self.assertLogs("zerver.middleware.json_error_handler", level="ERROR") as m:
-                self.client_post(
-                    self.url,
-                    payload,
-                    content_type="application/x-www-form-urlencoded",
-                )
-            self.assertIn(expected_error_messsage, m.output[0])
-
     def test_travis_noop(self) -> None:
         expected_error_message = """
 While no message is expected given expect_noop=True,
@@ -146,7 +129,8 @@ one or more new messages.
             )
         self.assertEqual(str(exc.exception), expected_error_message)
 
+    @override
     def get_body(self, fixture_name: str) -> str:
-        return urllib.parse.urlencode(
+        return urlencode(
             {"payload": self.webhook_fixture_data("travis", fixture_name, file_type="json")}
         )
